@@ -1,14 +1,12 @@
 persona: hospital
-display_name: "City Hospital"
+display_name: City Hospital
 mdr_rate_contracted: 0.018
-
 preferred_rails:
   default: neft
   fallback_chain:
-    - upi_intent
-    - hosted_checkout
-    - payment_link
-
+  - upi_intent
+  - payment_link
+  - hosted_checkout
 priority_rules:
   category_scores:
     critical_supply: 50
@@ -21,14 +19,12 @@ priority_rules:
     critical: 30
     established: 0
     new: -10
-
 compliance:
   schedule_h:
     action: escalate
     pre_auth: true
   schedule_x:
     action: queue
-
 payment_rules:
   max_amount_per_vendor: 500000
   require_approval_above: 100000
