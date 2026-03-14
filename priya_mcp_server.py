@@ -33,6 +33,7 @@ from scorer import score_vendors as _score_vendors, compute_credit_float
 # Config
 # ---------------------------------------------------------------------------
 FASTAPI_INTERNAL = os.getenv("FASTAPI_INTERNAL_URL", "http://localhost:8000/internal")
+RUN_ID = os.getenv("PRIYA_RUN_ID", "")
 DB_PATH = os.getenv("DB_PATH", "./priya.db")
 PERSONAS_DIR = os.getenv("PERSONAS_DIR", "./personas")
 INVOICES_DIR = os.getenv("INVOICES_DIR", "./invoices")
@@ -415,8 +416,12 @@ async def _dispatch(name: str, args: dict) -> list[TextContent]:
 
 async def _generate_token(_args: dict) -> list[TextContent]:
     result = await _pine.generate_token()
+    token = result.get("access_token", "")
+    # Store token in the run record so downstream tools can use it
+    if RUN_ID:
+        await _db.update_run_status(RUN_ID, "running", pine_token=token)
     return _ok({
-        "access_token": result.get("access_token"),
+        "access_token": token,
         "expires_at": result.get("expires_at"),
     })
 

@@ -12,7 +12,14 @@ import uuid
 from typing import Any, Callable, Coroutine, Optional
 
 import yaml
-from claude_agent_sdk import ClaudeAgentOptions, query
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    query,
+    AssistantMessage,
+    ResultMessage,
+    SystemMessage,
+    UserMessage,
+)
 
 PERSONAS_DIR = pathlib.Path(__file__).parent / "personas"
 MCP_SERVER_PATH = pathlib.Path(__file__).parent / "priya_mcp_server.py"
@@ -138,11 +145,10 @@ class PriyaAgentSession:
             f"Narrate each step clearly."
         )
 
-        mcp_servers = [
-            {
-                "name": "priya",
+        mcp_servers = {
+            "priya": {
                 "type": "stdio",
-                "command": "python",
+                "command": "python3",
                 "args": [str(MCP_SERVER_PATH)],
                 "env": {
                     "PRIYA_RUN_ID": self.run_id,
@@ -155,38 +161,46 @@ class PriyaAgentSession:
                     "DB_PATH": os.getenv("DB_PATH", "./priya.db"),
                 },
             }
-        ]
+        }
 
         options = ClaudeAgentOptions(
             system_prompt=system_prompt,
             allowed_tools=["Read", "Bash", "Glob", "mcp__priya__*"],
             mcp_servers=mcp_servers,
             permission_mode="bypassPermissions",
+            max_turns=50,
         )
+
+        import sys
+
+        def _on_stderr(line: str):
+            print(f"[AGENT-STDERR] {line}", file=sys.stderr)
+
+        options.stderr = _on_stderr
 
         try:
             async for message in query(prompt=user_prompt, options=options):
-                msg_type = message.get("type", "")
+                # Messages are typed SDK objects
+                if isinstance(message, AssistantMessage):
+                    # Extract text content from assistant message
+                    text_parts = []
+                    for block in (message.content or []):
+                        if hasattr(block, "text"):
+                            text_parts.append(block.text)
+                    if text_parts:
+                        await ws_broadcast({
+                            "type": "AGENT_MESSAGE",
+                            "run_id": self.run_id,
+                            "content": "\n".join(text_parts),
+                        })
 
-                # Capture session ID from init message
-                if msg_type == "init" and "session_id" in message:
-                    self.session_id = message["session_id"]
-
-                # Forward assistant text to WebSocket
-                if msg_type == "assistant" and message.get("content"):
+                elif isinstance(message, ResultMessage):
+                    self.session_id = getattr(message, "session_id", None) or self.session_id
                     await ws_broadcast({
-                        "type": "AGENT_MESSAGE",
+                        "type": "AGENT_RESULT",
                         "run_id": self.run_id,
-                        "content": message["content"],
-                    })
-
-                # Forward tool results
-                if msg_type == "tool_result":
-                    await ws_broadcast({
-                        "type": "TOOL_RESULT",
-                        "run_id": self.run_id,
-                        "tool": message.get("tool_name", ""),
-                        "result": message.get("result", ""),
+                        "duration_ms": getattr(message, "duration_ms", 0),
+                        "total_cost_usd": getattr(message, "total_cost_usd", 0),
                     })
 
         except Exception as e:

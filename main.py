@@ -38,6 +38,8 @@ active_connections: dict[str, list[WebSocket]] = {}  # run_id -> [ws]
 
 # Blocking gates: (type, id) -> Future that resolves when approved
 _wait_gates: dict[tuple[str, str], asyncio.Future] = {}
+# Pre-approved gates: store results for approvals that arrive before the wait
+_pre_approved: dict[tuple[str, str], dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +53,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="PRIYA", version="1.0.0", lifespan=lifespan)
+
+import traceback as _tb
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import JSONResponse as StarletteJSONResponse
+
+@app.exception_handler(Exception)
+async def _unhandled(request: StarletteRequest, exc: Exception):
+    _tb.print_exc()
+    return StarletteJSONResponse({"error": str(exc), "type": type(exc).__name__}, status_code=500)
 
 app.add_middleware(
     CORSMiddleware,
@@ -99,7 +110,9 @@ class EscalationRequest(BaseModel):
 
 
 class InternalEvent(BaseModel):
-    event: dict
+    event_type: Optional[str] = None
+    payload: Optional[dict] = None
+    event: Optional[dict] = None
 
 
 class InternalApproval(BaseModel):
@@ -173,9 +186,16 @@ async def start_run(req: RunRequest):
 
 @app.post("/approve/{run_id}")
 async def approve_run(run_id: str):
-    key = ("approval", run_id)
-    if key in _wait_gates and not _wait_gates[key].done():
-        _wait_gates[key].set_result({"approved": True})
+    resolved = False
+    for gate_type in ("approve", "approval"):
+        key = (gate_type, run_id)
+        if key in _wait_gates and not _wait_gates[key].done():
+            _wait_gates[key].set_result({"approved": True})
+            resolved = True
+    # If gate doesn't exist yet, store as pre-approved
+    if not resolved:
+        for gate_type in ("approve", "approval"):
+            _pre_approved[(gate_type, run_id)] = {"approved": True}
     await db.update_run_status(run_id, "approved", approved_at=datetime.utcnow().isoformat())
     await ws_broadcast(run_id, {"type": "APPROVAL_GRANTED"})
     return {"approved": True}
@@ -273,8 +293,15 @@ async def upload_csv(file: UploadFile):
 @app.post("/internal/event")
 async def internal_event(req: InternalEvent):
     """Broadcast a WebSocket event from the MCP server."""
-    run_id = req.event.get("run_id", "")
-    await ws_broadcast(run_id, req.event)
+    # Support both formats: {event: {...}} and {event_type: ..., payload: {...}}
+    if req.event:
+        event = req.event
+    elif req.event_type and req.payload:
+        event = {"type": req.event_type, **req.payload}
+    else:
+        return {"ok": False, "error": "no event data"}
+    run_id = event.get("run_id", "")
+    await ws_broadcast(run_id, event)
     return {"ok": True}
 
 
@@ -282,6 +309,11 @@ async def internal_event(req: InternalEvent):
 async def internal_wait(gate_type: str, gate_id: str):
     """Block until an approval/escalation decision is made. Called by MCP server."""
     key = (gate_type, gate_id)
+    # Check if already pre-approved
+    if key in _pre_approved:
+        result = _pre_approved.pop(key)
+        return result
+
     loop = asyncio.get_event_loop()
     future = loop.create_future()
     _wait_gates[key] = future
@@ -325,9 +357,10 @@ async def websocket_endpoint(websocket: WebSocket, run_id: str):
             try:
                 msg = json.loads(data)
                 if msg.get("type") == "approve":
-                    key = ("approval", run_id)
-                    if key in _wait_gates and not _wait_gates[key].done():
-                        _wait_gates[key].set_result({"approved": True})
+                    for gate_type in ("approve", "approval"):
+                        key = (gate_type, run_id)
+                        if key in _wait_gates and not _wait_gates[key].done():
+                            _wait_gates[key].set_result({"approved": True})
             except json.JSONDecodeError:
                 pass
     except WebSocketDisconnect:
