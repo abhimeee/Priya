@@ -236,16 +236,38 @@ async def get_all_settlements(
     page: int = 1,
     per_page: int = 10,
 ):
-    # Return pre-configured data filtered loosely by date
-    results = _SETTLEMENTS
-    start = (page - 1) * per_page
-    end = start + per_page
+    # Dynamically generate settlements from actual processed orders
+    settlements = []
+    utr_counter = 1
+    for order_id, order in _orders.items():
+        if order.get("status") in ("PROCESSED", "CAPTURED"):
+            amount_paisa = order.get("order_amount", {}).get("value", 0)
+            mdr_paisa = int(amount_paisa * 0.018)  # 1.8% MDR
+            settlements.append({
+                "utr": f"UTR{_now_iso()[:10].replace('-','')}{utr_counter:05d}",
+                "settlement_date": _now_iso()[:10],
+                "gross_amount": amount_paisa,
+                "mdr_amount": mdr_paisa,
+                "net_amount": amount_paisa - mdr_paisa,
+                "currency": "INR",
+                "order_count": 1,
+                "orders": [order_id],
+                "bank_account": "XXXX1234",
+            })
+            utr_counter += 1
+
+    # If no dynamic settlements, fall back to pre-configured
+    if not settlements:
+        settlements = _SETTLEMENTS
+
+    start_idx = (page - 1) * per_page
+    end_idx = start_idx + per_page
     return JSONResponse({
-        "data": results[start:end],
+        "data": settlements[start_idx:end_idx],
         "pagination": {
             "page": page,
             "per_page": per_page,
-            "total": len(results),
+            "total": len(settlements),
         },
     })
 

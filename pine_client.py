@@ -12,7 +12,8 @@ import httpx
 PINE_BASE_URL = os.getenv("PINE_BASE_URL", "https://pluraluat.v2.pinepg.in/api")
 PINE_CLIENT_ID = os.getenv("PINE_CLIENT_ID", "")
 PINE_CLIENT_SECRET = os.getenv("PINE_CLIENT_SECRET", "")
-PINE_MID = os.getenv("PINE_MID", "")
+_PINE_MID_RAW = os.getenv("PINE_MID", "")
+PINE_MID = int(_PINE_MID_RAW) if _PINE_MID_RAW.isdigit() else _PINE_MID_RAW
 PINE_MOCK = os.getenv("PINE_MOCK", "false").lower() == "true"
 
 MOCK_BASE_URL = "http://localhost:9100"
@@ -63,12 +64,26 @@ class PineLabs:
             "merchant_order_reference": merchant_order_reference,
             "order_amount": {"value": amount_paisa, "currency": "INR"},
             "pre_auth": pre_auth,
+            "purchase_details": {
+                "customer": {
+                    "email_id": "payments@priya.ai",
+                    "first_name": "PRIYA",
+                    "last_name": "Agent",
+                    "customer_id": "PRIYA-001",
+                    "mobile_number": "9999999999",
+                },
+            },
         }
         if callback_url:
             body["callback_url"] = callback_url
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(url, json=body, headers=_common_headers(token))
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                detail = resp.text[:500]
+                raise httpx.HTTPStatusError(
+                    f"Pine Labs create_order {resp.status_code}: {detail}",
+                    request=resp.request, response=resp,
+                )
             return resp.json()
 
     async def get_order(self, token: str, order_id: str) -> dict:
@@ -189,6 +204,23 @@ class PineLabs:
         page: int = 1,
         per_page: int = 10,
     ) -> dict:
+        """Fetch settlements list.
+
+        Pine Labs UAT/PROD requires dates in the format ``YYYY-MM-DDTHH:MM:SS``
+        (no timezone suffix — Z or +05:30 will return INVALID_DATE 400).
+        Callers may pass plain ``YYYY-MM-DD`` strings; this method will
+        normalise them automatically.
+
+        Confirmed via MCP docs (pinelabs-mcp-server v7.0.0) and live testing:
+        - Correct:  ``2026-03-01T00:00:00``
+        - Wrong:    ``2026-03-01``, ``2026-03-01T00:00:00Z``, epoch ms
+        """
+        # Normalise plain YYYY-MM-DD → YYYY-MM-DDTHH:MM:SS
+        if len(start_date) == 10:
+            start_date = f"{start_date}T00:00:00"
+        if len(end_date) == 10:
+            end_date = f"{end_date}T23:59:59"
+
         url = f"{_base_url()}/settlements/v1/list"
         params = {
             "start_date": start_date,
@@ -227,11 +259,23 @@ class PineLabs:
             "merchant_id": PINE_MID,
             "amount": {"value": amount_paisa, "currency": "INR"},
             "merchant_payment_link_reference": merchant_payment_link_reference,
-            "description": description,
+            "description": description or "PRIYA vendor payment",
+            "customer": {
+                "email_id": "payments@priya.ai",
+                "first_name": "PRIYA",
+                "last_name": "Agent",
+                "customer_id": "PRIYA-001",
+                "mobile_number": "9999999999",
+            },
         }
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(url, json=body, headers=_common_headers(token))
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                detail = resp.text[:500]
+                raise httpx.HTTPStatusError(
+                    f"Pine Labs create_payment_link {resp.status_code}: {detail}",
+                    request=resp.request, response=resp,
+                )
             return resp.json()
 
     async def hosted_checkout(
@@ -247,6 +291,15 @@ class PineLabs:
             "merchant_order_reference": merchant_order_reference,
             "order_amount": {"value": amount_paisa, "currency": "INR"},
             "callback_url": callback_url,
+            "purchase_details": {
+                "customer": {
+                    "email_id": "payments@priya.ai",
+                    "first_name": "PRIYA",
+                    "last_name": "Agent",
+                    "customer_id": "PRIYA-001",
+                    "mobile_number": "9999999999",
+                },
+            },
         }
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             resp = await client.post(url, json=body, headers=_common_headers(token))

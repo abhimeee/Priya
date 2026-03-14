@@ -1,7 +1,21 @@
-vendor_id,vendor_name,category,amount,preferred_rail,vendor_type,drug_schedule,is_compliant,credit_days,invoice_date,due_date
-vnd_insulin_depot_001,Insulin Depot,critical_supply,45000,neft,critical,,true,0,2026-03-12,2026-03-12
-vnd_medchem_pharma_002,MedChem Pharma,pharma_general,32000,neft,established,schedule_h,false,0,2026-03-14,2026-03-14
-vnd_surgical_supplies_003,Surgical Supplies Co,surgical_equipment,28000,neft,established,,true,0,2026-03-14,2026-03-14
-vnd_bandage_world_004,Bandage World,consumables,8500,neft,new,,true,0,2026-03-14,2026-03-14
-vnd_spice_house_005,Spice House Catering,standard,12000,upi,established,,true,0,2026-03-14,2026-03-14
-vnd_lab_reagents_006,Lab Reagents Inc,critical_supply,18500,neft,critical,,true,0,2026-03-09,2026-03-09
+vendor_id,vendor_name,category,amount,preferred_rail,vendor_type,drug_schedule,is_compliant,credit_days,invoice_date,due_date,invoice_number,items
+vnd_ranbaxy_001,Ranbaxy Laboratories,pharma_general,250000,neft,established,schedule_h,true,0,2026-03-01,2026-03-25,RX-2026-001,15
+vnd_mankind_002,Mankind Pharma,pharma_general,180000,neft,established,,true,0,2026-03-05,2026-03-28,MK-2026-042,12
+vnd_sunpharma_003,Sun Pharmaceutical,critical_supply,320000,neft,critical,schedule_h,true,0,2026-02-20,2026-03-20,SUN-2026-108,8
+vnd_apollo_004,Apollo Pharmacy,consumables,95000,neft,established,,true,0,2026-03-08,2026-03-22,APL-2026-015,20
+vnd_medicare_005,Medicare Pharmacy,consumables,67500,neft,new,,true,0,2026-03-10,2026-03-26,MED-2026-089,14
+vnd_pharmeasy_006,PharmEasy,pharma_general,125000,neft,established,schedule_h,true,0,2026-02-18,2026-03-18,PE-2026-267,25
+vnd_cipla_007,Cipla Ltd,pharma_general,210000,neft,established,,true,0,2026-03-03,2026-03-23,CIP-2026-056,18
+vnd_drreddy_008,Dr. Reddy's Labs,pharma_general,295000,neft,established,,true,0,2026-03-07,2026-03-29,DRL-2026-134,11
+vnd_lupin_009,Lupin Pharma,pharma_general,215000,neft,established,,true,0,2026-02-28,2026-02-28,LUP-2026-073,16
+vnd_netmeds_010,NetMeds,consumables,89000,upi,new,,true,0,2026-03-12,2026-03-30,NM-2026-156,22
+vnd_aurobindo_011,Aurobindo Pharma,pharma_general,275000,neft,established,schedule_h,true,0,2026-03-02,2026-03-27,AUR-2026-089,13
+vnd_medlife_012,Medlife,consumables,112000,neft,established,,true,0,2026-02-21,2026-03-21,ML-2026-234,19
+vnd_gsk_013,Glaxo Smithkline,critical_supply,340000,neft,critical,,true,0,2026-03-06,2026-03-31,GSK-2026-045,9
+vnd_1mg_014,1mg Pharmacy,consumables,78500,upi,new,,true,0,2026-03-09,2026-03-24,1MG-2026-198,17
+vnd_alembic_015,Alembic Pharma,pharma_general,168000,neft,established,,true,0,2026-02-22,2026-03-19,ALB-2026-067,10
+vnd_care_016,Care Pharmacy,consumables,98000,upi,established,,true,0,2026-03-11,2026-03-28,CARE-2026-312,23
+vnd_torrent_017,Torrent Pharma,pharma_general,238000,neft,established,,true,0,2026-03-04,2026-03-26,TOR-2026-091,14
+vnd_healthkart_018,Healthkart,consumables,145000,neft,established,,true,0,2026-02-25,2026-03-22,HK-2026-501,28
+vnd_divis_019,Divi's Laboratories,critical_supply,285000,neft,critical,,true,0,2026-03-08,2026-03-30,DIVI-2026-102,7
+vnd_wellness_020,Wellness Forever,consumables,156000,neft,established,,true,0,2026-02-28,2026-03-25,WF-2026-445,31

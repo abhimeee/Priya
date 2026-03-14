@@ -1,7 +1,16 @@
-vendor_id,vendor_name,category,amount,preferred_rail,vendor_type,drug_schedule,is_compliant,credit_days,invoice_date,due_date
-vnd_sharma_wholesale_001,Sharma Wholesale,goods,28000,upi,established,,true,15,2026-03-06,2026-03-21
-vnd_delhi_dairy_002,Delhi Dairy Co,dairy,12000,upi,critical,,true,0,2026-03-14,2026-03-14
-vnd_gupta_beverages_003,Gupta Beverages,beverages,9500,upi,established,,true,7,2026-03-10,2026-03-17
-vnd_patel_snacks_004,Patel Snacks,goods,15000,upi,new,,true,0,2026-03-14,2026-03-14
-vnd_fresh_produce_005,Fresh Produce Farm,dairy,8200,upi,established,,true,0,2026-03-14,2026-03-14
-vnd_cleaning_depot_006,Cleaning Supplies Depot,standard,4800,upi,established,,true,30,2026-02-18,2026-03-19
+vendor_id,vendor_name,category,amount,preferred_rail,vendor_type,drug_schedule,is_compliant,credit_days,invoice_date,due_date,invoice_number,items
+vnd_hul_001,Hindustan Unilever,goods,185000,upi,established,,true,15,2026-03-01,2026-03-25,HUL-2026-001,45
+vnd_itc_002,ITC Limited,goods,142000,upi,established,,true,15,2026-03-05,2026-03-28,ITC-2026-042,38
+vnd_parle_003,Parle Products,goods,78000,upi,established,,true,0,2026-02-20,2026-03-20,PAR-2026-108,22
+vnd_amul_004,Amul Dairy,dairy,95000,upi,critical,,true,0,2026-03-08,2026-03-22,AML-2026-015,18
+vnd_britannia_005,Britannia Industries,goods,67500,upi,established,,true,7,2026-03-10,2026-03-26,BRT-2026-089,25
+vnd_dabur_006,Dabur India,goods,125000,upi,established,,true,0,2026-02-18,2026-03-18,DAB-2026-267,32
+vnd_marico_007,Marico Ltd,goods,92000,upi,established,,true,10,2026-03-03,2026-03-23,MAR-2026-056,20
+vnd_godrej_008,Godrej Consumer,goods,110000,upi,established,,true,15,2026-03-07,2026-03-29,GCP-2026-134,28
+vnd_haldiram_009,Haldiram Foods,goods,156000,upi,established,,true,0,2026-02-15,2026-02-28,HLD-2026-073,15
+vnd_patanjali_010,Patanjali Ayurved,goods,89000,upi,new,,true,0,2026-03-12,2026-03-30,PAT-2026-156,35
+vnd_nestle_011,Nestle India,goods,198000,upi,established,,true,30,2026-03-02,2026-03-27,NES-2026-089,42
+vnd_pg_012,P&G India,goods,175000,upi,established,,true,0,2026-02-21,2026-03-21,PG-2026-234,30
+vnd_tata_013,Tata Consumer,goods,134000,upi,established,,true,15,2026-03-06,2026-03-31,TATA-2026-045,24
+vnd_motherdairy_014,Mother Dairy,dairy,62000,upi,critical,,true,0,2026-03-09,2026-03-24,MD-2026-198,12
+vnd_bikaji_015,Bikaji Foods,goods,48000,upi,established,,true,0,2026-02-22,2026-03-19,BKJ-2026-067,18

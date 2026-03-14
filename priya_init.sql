@@ -13,6 +13,14 @@ CREATE TABLE IF NOT EXISTS vendors (
   vendor_type TEXT NOT NULL DEFAULT 'established',
   drug_schedule TEXT,
   is_compliant INTEGER DEFAULT 1,
+  amount REAL DEFAULT 0,
+  invoice_number TEXT,
+  invoice_date TEXT,
+  due_date TEXT,
+  items INTEGER DEFAULT 0,
+  priority_score INTEGER DEFAULT 0,
+  priority_reason TEXT DEFAULT '',
+  action TEXT DEFAULT 'pay',
   created_at DATETIME NOT NULL
 );
 
@@ -94,7 +102,7 @@ CREATE TABLE IF NOT EXISTS reconciliations (
   id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL REFERENCES runs(id),
   order_id TEXT NOT NULL,
-  payment_id TEXT NOT NULL,
+  payment_id TEXT,
   settlement_id TEXT,
   vendor_id TEXT NOT NULL,
   pine_order_id TEXT NOT NULL,
@@ -114,10 +122,22 @@ CREATE TABLE IF NOT EXISTS reconciliations (
   pre_auth_used INTEGER DEFAULT 0,
   agent_reasoning TEXT NOT NULL,
   ca_notes TEXT,
-  created_at DATETIME NOT NULL
+  created_at DATETIME NOT NULL,
+  checks TEXT,
+  recon_status TEXT DEFAULT 'PENDING',
+  bank_credit_amount REAL,
+  bank_delta REAL,
+  settlement_delay_days INTEGER
 );
 
+-- Migrate existing reconciliations tables that pre-date the new columns
+-- (SQLite ignores "duplicate column" errors via IF NOT EXISTS workaround via separate stmts)
+-- We use a no-op approach: ALTER TABLE only errors on duplicate col; wrap in separate statements.
+-- These are intentionally listed after the CREATE TABLE so that brand-new DBs are fine.
+-- For in-place upgrades we catch SQLITE_ERROR at init time in db.py.
+
 -- Core indexes
+CREATE INDEX IF NOT EXISTS idx_vendors_persona ON vendors(persona);
 CREATE INDEX IF NOT EXISTS idx_orders_pine    ON orders(pine_order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_mor     ON orders(merchant_order_reference);
 CREATE INDEX IF NOT EXISTS idx_orders_run     ON orders(run_id);

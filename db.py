@@ -25,6 +25,22 @@ class PriyaDB:
         sql = SQL_INIT.read_text()
         await self._db.executescript(sql)
         await self._db.commit()
+        # Migrate existing reconciliations tables to add new columns (idempotent)
+        _new_recon_cols = [
+            ("checks", "TEXT"),
+            ("recon_status", "TEXT DEFAULT 'PENDING'"),
+            ("bank_credit_amount", "REAL"),
+            ("bank_delta", "REAL"),
+            ("settlement_delay_days", "INTEGER"),
+        ]
+        for col, typedef in _new_recon_cols:
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE reconciliations ADD COLUMN {col} {typedef}"
+                )
+                await self._db.commit()
+            except Exception:
+                pass  # Column already exists — safe to ignore
 
     async def close(self) -> None:
         if self._db:
@@ -51,7 +67,11 @@ class PriyaDB:
             "id": None, "name": None, "persona": None, "category": None,
             "upi_id": None, "bank_account": None, "ifsc": None,
             "preferred_rail": "upi", "credit_days": 0, "vendor_type": "established",
-            "drug_schedule": None, "is_compliant": 1, "created_at": self._now(),
+            "drug_schedule": None, "is_compliant": 1,
+            "amount": 0, "invoice_number": None, "invoice_date": None,
+            "due_date": None, "items": 0,
+            "priority_score": 0, "priority_reason": "", "action": "pay",
+            "created_at": self._now(),
         }
         row = {**defaults, **vendor}
         await self._db.execute(
@@ -59,11 +79,13 @@ class PriyaDB:
             INSERT INTO vendors (
                 id, name, persona, category, upi_id, bank_account, ifsc,
                 preferred_rail, credit_days, vendor_type, drug_schedule,
-                is_compliant, created_at
+                is_compliant, amount, invoice_number, invoice_date, due_date,
+                items, priority_score, priority_reason, action, created_at
             ) VALUES (
                 :id, :name, :persona, :category, :upi_id, :bank_account, :ifsc,
                 :preferred_rail, :credit_days, :vendor_type, :drug_schedule,
-                :is_compliant, :created_at
+                :is_compliant, :amount, :invoice_number, :invoice_date, :due_date,
+                :items, :priority_score, :priority_reason, :action, :created_at
             )
             ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name, persona=excluded.persona,
@@ -73,7 +95,15 @@ class PriyaDB:
                 credit_days=excluded.credit_days,
                 vendor_type=excluded.vendor_type,
                 drug_schedule=excluded.drug_schedule,
-                is_compliant=excluded.is_compliant
+                is_compliant=excluded.is_compliant,
+                amount=excluded.amount,
+                invoice_number=excluded.invoice_number,
+                invoice_date=excluded.invoice_date,
+                due_date=excluded.due_date,
+                items=excluded.items,
+                priority_score=excluded.priority_score,
+                priority_reason=excluded.priority_reason,
+                action=excluded.action
             """,
             row,
         )
@@ -212,7 +242,7 @@ class PriyaDB:
     ) -> None:
         fields = {"pine_status": pine_status}
         fields.update(kwargs)
-        if pine_status == "SUCCESS" and "confirmed_at" not in fields:
+        if pine_status in ("SUCCESS", "PROCESSED") and "confirmed_at" not in fields:
             fields["confirmed_at"] = self._now()
         set_clause = ", ".join(f"{k} = :{k}" for k in fields)
         fields["_id"] = payment_id
@@ -225,6 +255,12 @@ class PriyaDB:
         return await self._fetchall(
             "SELECT * FROM payments WHERE order_id = ? ORDER BY attempt_number",
             (order_id,),
+        )
+
+    async def get_payments_by_pine_order(self, pine_order_id: str) -> list[dict]:
+        return await self._fetchall(
+            "SELECT * FROM payments WHERE pine_order_id = ? ORDER BY attempt_number",
+            (pine_order_id,),
         )
 
     # ------------------------------------------------------------------ settlements
@@ -262,6 +298,18 @@ class PriyaDB:
             (run_id,),
         )
 
+    async def get_settlements_by_utr(self, utr_number: str) -> list[dict]:
+        return await self._fetchall(
+            "SELECT * FROM settlements WHERE utr_number = ? ORDER BY created_at",
+            (utr_number,),
+        )
+
+    async def get_reconciliations_by_utr(self, run_id: str, utr_number: str) -> list[dict]:
+        return await self._fetchall(
+            "SELECT * FROM reconciliations WHERE run_id = ? AND utr_number = ? ORDER BY created_at",
+            (run_id, utr_number),
+        )
+
     # ------------------------------------------------------------------ reconciliations
     async def insert_reconciliation(self, recon: dict) -> None:
         defaults = {
@@ -273,6 +321,9 @@ class PriyaDB:
             "mdr_drift_flagged": 0, "rail_used": None, "retries": 0,
             "outcome": "pending", "pre_auth_used": 0, "agent_reasoning": "",
             "ca_notes": None, "created_at": self._now(),
+            "checks": None, "recon_status": "PENDING",
+            "bank_credit_amount": None, "bank_delta": None,
+            "settlement_delay_days": None,
         }
         row = {**defaults, **recon}
         await self._db.execute(
@@ -283,17 +334,46 @@ class PriyaDB:
                 invoice_amount, paid_amount, settled_amount, variance,
                 mdr_rate_actual, mdr_rate_contracted, mdr_drift_flagged,
                 rail_used, retries, outcome, pre_auth_used, agent_reasoning,
-                ca_notes, created_at
+                ca_notes, created_at, checks, recon_status, bank_credit_amount,
+                bank_delta, settlement_delay_days
             ) VALUES (
                 :id, :run_id, :order_id, :payment_id, :settlement_id, :vendor_id,
                 :pine_order_id, :merchant_order_reference, :utr_number, :persona,
                 :invoice_amount, :paid_amount, :settled_amount, :variance,
                 :mdr_rate_actual, :mdr_rate_contracted, :mdr_drift_flagged,
                 :rail_used, :retries, :outcome, :pre_auth_used, :agent_reasoning,
-                :ca_notes, :created_at
+                :ca_notes, :created_at, :checks, :recon_status, :bank_credit_amount,
+                :bank_delta, :settlement_delay_days
             )
             """,
             row,
+        )
+        await self._db.commit()
+
+    async def update_bank_credit(
+        self,
+        recon_id: str,
+        bank_credit_amount: float,
+        bank_delta: float,
+        recon_status: str,
+        checks: str,
+    ) -> None:
+        await self._db.execute(
+            """
+            UPDATE reconciliations
+            SET bank_credit_amount = :bank_credit_amount,
+                bank_delta = :bank_delta,
+                recon_status = :recon_status,
+                checks = :checks
+            WHERE id = :id
+            """,
+            {
+                "bank_credit_amount": bank_credit_amount,
+                "bank_delta": bank_delta,
+                "recon_status": recon_status,
+                "checks": checks,
+                "id": recon_id,
+            },
         )
         await self._db.commit()
 

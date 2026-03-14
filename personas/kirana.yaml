@@ -13,6 +13,7 @@ priority_rules:
     dairy: 20
     goods: 10
     beverages: 5
+    standard: 3
   credit_rules:
     cod_bonus: 40
     expired_credit_bonus: 30

@@ -15,11 +15,12 @@ priority_rules:
     surgical_equipment: 40
     pharma_general: 20
     consumables: 10
+    standard: 5
   overdue_bonus_per_day: 10
   vendor_type_scores:
     critical: 30
     established: 0
-    new: -20
+    new: -10
 
 compliance:
   schedule_h:

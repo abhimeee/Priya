@@ -26,7 +26,7 @@ MCP_SERVER_PATH = pathlib.Path(__file__).parent / "priya_mcp_server.py"
 
 DB_SCHEMA_TEXT = """
 Tables:
-  vendors(id, name, persona, category, upi_id, bank_account, ifsc, preferred_rail, credit_days, vendor_type, drug_schedule, is_compliant, created_at)
+  vendors(id, name, persona, category, upi_id, bank_account, ifsc, preferred_rail, credit_days, vendor_type, drug_schedule, is_compliant, amount, invoice_number, invoice_date, due_date, items, priority_score, priority_reason, action, created_at)
   runs(id, persona, instruction, invoice_source, pine_token, status, total_vendors, total_amount, paid_amount, deferred_amount, float_saved, started_at, completed_at, approved_at)
   orders(id, run_id, vendor_id, pine_order_id, merchant_order_reference, amount, priority_score, priority_reason, action, pre_auth, pine_status, escalation_flag, defer_reason, created_at, updated_at)
   payments(id, run_id, order_id, vendor_id, pine_order_id, pine_payment_id, merchant_payment_reference, amount, rail, attempt_number, pine_status, failure_reason, recovery_action, webhook_event, request_id, initiated_at, confirmed_at)
@@ -77,28 +77,33 @@ Preferred rails: {yaml.dump(preferred_rails, default_flow_style=True).strip()}
 ## Pine Labs Pipeline Steps
 Execute these steps IN ORDER for each vendor payment run:
 
-1. **LOAD**: Read the CSV file and parse vendor invoices
-2. **SCORE**: Score and prioritize vendors using the scoring engine (call mcp__priya__score_vendors)
-3. **APPROVE**: Present the payment plan to the user for approval (call mcp__priya__request_approval). WAIT for approval before proceeding.
-4. **ORDER**: For each approved vendor, create a Pine Labs order (call mcp__priya__create_pine_order)
-5. **PAY**: Execute payment for each order using preferred rail with fallback chain (call mcp__priya__execute_payment)
-6. **SETTLE**: After payments complete, fetch settlement data (call mcp__priya__fetch_settlements)
-7. **RECON**: Reconcile payments against settlements, flag variances (call mcp__priya__reconcile_payment)
-8. **FINALIZE**: Generate run summary with metrics (call mcp__priya__finalize_run)
+1. **AUTH**: Generate Pine Labs auth token (call mcp__priya__generate_token)
+2. **LOAD**: Parse vendor invoice CSV (call mcp__priya__load_invoices)
+3. **SCORE**: Score and prioritize vendors (call mcp__priya__score_vendors)
+4. **APPROVE**: Present payment plan and WAIT for human approval (call mcp__priya__request_policy_approval)
+5. **ORDER**: Create ONE batch Pine Labs order grouping ALL vendors (call mcp__priya__create_batch_order). Do NOT create individual orders per vendor.
+6. **PAY**: Execute ONE batch payment for the total amount (call mcp__priya__create_batch_payment with rail="payment_link"). On failure, use mcp__priya__switch_rail_and_retry.
+7. **WAIT FOR PAYMENT**: CRITICAL — After payment link is generated, you MUST call mcp__priya__await_payment_confirmation(run_id) and WAIT for the Pine Labs webhook to confirm the payment. The payment link is just a link — the vendor has not paid yet. Do NOT proceed to settlements until this tool returns with confirmed_count > 0. The webhook (ORDER_PROCESSED) from Pine Labs will update the payment status in our DB.
+8. **SETTLE**: Fetch settlement data (call mcp__priya__run_settlements with today's date range)
+9. **RECON**: Reconcile payments vs settlements (call mcp__priya__run_reconciliation)
+10. **FINALIZE**: Generate run summary (call mcp__priya__finalize_run)
+
+IMPORTANT: Use create_batch_order and create_batch_payment to group all vendors into a SINGLE Pine Labs order and payment. Do NOT loop through vendors creating individual orders.
 
 ## Rules
 - ALWAYS emit AGENT_NARRATION events via mcp__priya__emit_event to narrate what you are doing
 - ALWAYS write to DB via MCP tools — never skip DB writes
 - All monetary amounts are in RUPEES (the MCP tools handle paisa conversion for Pine Labs)
-- For hospital persona: use pre_auth=true ONLY for schedule_h drug vendors
+- Group ALL vendors into ONE Pine Labs order via create_batch_order, then ONE payment via create_batch_payment
+- ALWAYS use rail="payment_link" for create_batch_payment (this is the working rail on Pine Labs UAT)
+- For hospital persona: if any vendor has schedule_h, set pre_auth=true on the batch order
 - For kirana persona: defer vendors with remaining credit days, track float_saved
-- If a payment fails, try the next rail in the fallback chain before escalating
-- Emit CANVAS_STATE events at major transitions (loading, scoring, approving, paying, settling, reconciling, complete)
-- Emit VENDOR_STATE events when a vendor's status changes
-- Emit PIPELINE_STEP events at each pipeline stage transition
-- On escalation (schedule_h drugs, compliance issues), emit ESCALATION event and wait for human decision
-- Emit RAIL_SWITCH event when falling back to a different payment rail
-- At the end, emit RUN_SUMMARY with aggregate metrics
+- If batch payment fails, use switch_rail_and_retry to try "hosted_checkout" as fallback
+- CRITICAL: After create_batch_payment with payment_link rail, ALWAYS call await_payment_confirmation BEFORE run_settlements. A payment link being generated does NOT mean payment was received. You must wait for the Pine Labs ORDER_PROCESSED webhook.
+- Keep narration concise — short status updates, not verbose tables
+- Emit CANVAS_STATE events at major transitions
+- The MCP tools automatically emit VENDOR_STATE and PIPELINE_STEP events — you don't need to emit them manually
+- At the end, call finalize_run to emit RUN_SUMMARY with aggregate metrics
 
 ## DB Schema
 {DB_SCHEMA_TEXT}
@@ -163,12 +168,32 @@ class PriyaAgentSession:
             }
         }
 
+        # Use Bedrock if configured, otherwise fall back to Anthropic API
+        model = os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "us.anthropic.claude-sonnet-4-6")
+        use_bedrock = os.getenv("CLAUDE_CODE_USE_BEDROCK", "0") == "1"
+
+        # Build env dict for Bedrock auth
+        agent_env: dict[str, str] = {
+            # Unset CLAUDECODE to allow nested SDK sessions when running inside Claude Code
+            "CLAUDECODE": "",
+        }
+        if use_bedrock:
+            agent_env["CLAUDE_CODE_USE_BEDROCK"] = "1"
+            agent_env["AWS_REGION"] = os.getenv("AWS_REGION", "us-east-1")
+            # Pass through AWS credentials if set
+            for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE"):
+                val = os.getenv(key)
+                if val:
+                    agent_env[key] = val
+
         options = ClaudeAgentOptions(
             system_prompt=system_prompt,
+            model=model,
             allowed_tools=["Read", "Bash", "Glob", "mcp__priya__*"],
             mcp_servers=mcp_servers,
             permission_mode="bypassPermissions",
             max_turns=50,
+            env=agent_env,
         )
 
         import sys
