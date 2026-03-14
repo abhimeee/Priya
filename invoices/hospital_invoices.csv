@@ -1,0 +1,7 @@
+vendor_id,vendor_name,category,amount,preferred_rail,vendor_type,drug_schedule,is_compliant,credit_days,invoice_date,due_date
+vnd_insulin_depot_001,Insulin Depot,critical_supply,45000,neft,critical,,true,0,2026-03-12,2026-03-12
+vnd_medchem_pharma_002,MedChem Pharma,pharma_general,32000,neft,established,schedule_h,false,0,2026-03-14,2026-03-14
+vnd_surgical_supplies_003,Surgical Supplies Co,surgical_equipment,28000,neft,established,,true,0,2026-03-14,2026-03-14
+vnd_bandage_world_004,Bandage World,consumables,8500,neft,new,,true,0,2026-03-14,2026-03-14
+vnd_spice_house_005,Spice House Catering,standard,12000,upi,established,,true,0,2026-03-14,2026-03-14
+vnd_lab_reagents_006,Lab Reagents Inc,critical_supply,18500,neft,critical,,true,0,2026-03-09,2026-03-09

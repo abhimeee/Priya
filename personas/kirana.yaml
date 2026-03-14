@@ -1,0 +1,26 @@
+persona: kirana
+display_name: "Sharma General Store"
+mdr_rate_contracted: 0.015
+
+preferred_rails:
+  default: upi
+  fallback_chain:
+    - upi_intent
+    - payment_link
+
+priority_rules:
+  category_scores:
+    dairy: 20
+    goods: 10
+    beverages: 5
+  credit_rules:
+    cod_bonus: 40
+    expired_credit_bonus: 30
+    defer_if_credit_remaining: true
+  vendor_type_scores:
+    critical: 20
+    new: 10
+
+float_optimization:
+  enabled: true
+  metric_name: float_saved

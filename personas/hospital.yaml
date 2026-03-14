@@ -1,0 +1,33 @@
+persona: hospital
+display_name: "City Hospital"
+mdr_rate_contracted: 0.018
+
+preferred_rails:
+  default: neft
+  fallback_chain:
+    - upi_intent
+    - hosted_checkout
+    - payment_link
+
+priority_rules:
+  category_scores:
+    critical_supply: 50
+    surgical_equipment: 40
+    pharma_general: 20
+    consumables: 10
+  overdue_bonus_per_day: 10
+  vendor_type_scores:
+    critical: 30
+    established: 0
+    new: -20
+
+compliance:
+  schedule_h:
+    action: escalate
+    pre_auth: true
+  schedule_x:
+    action: queue
+
+payment_rules:
+  max_amount_per_vendor: 500000
+  require_approval_above: 100000

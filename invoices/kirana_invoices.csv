@@ -1,0 +1,7 @@
+vendor_id,vendor_name,category,amount,preferred_rail,vendor_type,drug_schedule,is_compliant,credit_days,invoice_date,due_date
+vnd_sharma_wholesale_001,Sharma Wholesale,goods,28000,upi,established,,true,15,2026-03-06,2026-03-21
+vnd_delhi_dairy_002,Delhi Dairy Co,dairy,12000,upi,critical,,true,0,2026-03-14,2026-03-14
+vnd_gupta_beverages_003,Gupta Beverages,beverages,9500,upi,established,,true,7,2026-03-10,2026-03-17
+vnd_patel_snacks_004,Patel Snacks,goods,15000,upi,new,,true,0,2026-03-14,2026-03-14
+vnd_fresh_produce_005,Fresh Produce Farm,dairy,8200,upi,established,,true,0,2026-03-14,2026-03-14
+vnd_cleaning_depot_006,Cleaning Supplies Depot,standard,4800,upi,established,,true,30,2026-02-18,2026-03-19
