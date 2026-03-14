@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -78,13 +78,17 @@ app.add_middleware(
 async def ws_broadcast(run_id: str, event: dict) -> None:
     """Send an event to all WebSocket clients for a run."""
     event.setdefault("run_id", run_id)
-    event.setdefault("ts", datetime.utcnow().isoformat())
-    payload = json.dumps(event)
+    event.setdefault("timestamp", datetime.utcnow().isoformat())
+    # Ensure payload wrapper for frontend compatibility
+    if "payload" not in event:
+        payload = {k: v for k, v in event.items() if k not in ("type", "run_id", "timestamp")}
+        event = {"type": event.get("type", ""), "payload": payload, "run_id": event.get("run_id", run_id), "timestamp": event.get("timestamp", "")}
+    text = json.dumps(event)
     conns = active_connections.get(run_id, [])
     dead: list[WebSocket] = []
     for ws in conns:
         try:
-            await ws.send_text(payload)
+            await ws.send_text(text)
         except Exception:
             dead.append(ws)
     for ws in dead:
@@ -123,15 +127,35 @@ class InternalApproval(BaseModel):
 # REST — Run lifecycle
 # ---------------------------------------------------------------------------
 @app.post("/run")
-async def start_run(req: RunRequest):
-    run_id = f"run-{uuid.uuid4().hex[:12]}"
+async def start_run(request: Request):
+    content_type = request.headers.get("content-type", "")
 
-    if not req.csv_file:
-        raise HTTPException(400, "csv_file path is required")
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        persona = form.get("persona", "hospital")
+        instruction = form.get("instruction", "")
+        csv_file_field = form.get("csv_file")
 
-    csv_path = req.csv_file
-    if not pathlib.Path(csv_path).exists():
+        if csv_file_field and hasattr(csv_file_field, 'read'):
+            content = await csv_file_field.read()
+            filename = getattr(csv_file_field, 'filename', 'upload.csv')
+            dest = UPLOAD_DIR / f"{uuid.uuid4().hex[:8]}_{filename}"
+            dest.write_bytes(content)
+            csv_path = str(dest)
+        elif isinstance(csv_file_field, str):
+            csv_path = csv_file_field
+        else:
+            raise HTTPException(400, "csv_file is required")
+    else:
+        body = await request.json()
+        persona = body.get("persona", "hospital")
+        instruction = body.get("instruction", "")
+        csv_path = body.get("csv_file", "")
+
+    if not csv_path or not pathlib.Path(csv_path).exists():
         raise HTTPException(400, f"CSV file not found: {csv_path}")
+
+    run_id = f"run-{uuid.uuid4().hex[:12]}"
 
     # Count vendors and total from CSV
     with open(csv_path, newline="") as f:
@@ -144,8 +168,8 @@ async def start_run(req: RunRequest):
     now = datetime.utcnow().isoformat()
     await db.create_run({
         "id": run_id,
-        "persona": req.persona,
-        "instruction": req.instruction,
+        "persona": persona,
+        "instruction": instruction,
         "invoice_source": csv_path,
         "pine_token": "",  # agent will obtain via MCP
         "status": "running",
@@ -162,8 +186,8 @@ async def start_run(req: RunRequest):
     # Create agent session and run in background
     session = PriyaAgentSession(
         run_id=run_id,
-        persona=req.persona,
-        instruction=req.instruction,
+        persona=persona,
+        instruction=instruction,
         csv_path=csv_path,
     )
     active_sessions[run_id] = session
@@ -203,13 +227,20 @@ async def approve_run(run_id: str):
 
 @app.post("/escalation/{run_id}/{vendor_id}")
 async def handle_escalation(run_id: str, vendor_id: str, req: EscalationRequest):
+    # Map frontend values to backend values
+    decision = req.decision
+    if decision == "capture":
+        decision = "approve"
+    elif decision == "cancel":
+        decision = "reject"
+
     key = ("escalation", f"{run_id}:{vendor_id}")
     if key in _wait_gates and not _wait_gates[key].done():
-        _wait_gates[key].set_result({"decision": req.decision, "reason": req.reason})
+        _wait_gates[key].set_result({"decision": decision, "reason": req.reason})
     await ws_broadcast(run_id, {
         "type": "ESCALATION_RESOLVED",
         "vendor_id": vendor_id,
-        "decision": req.decision,
+        "decision": decision,
     })
     return {"ok": True}
 
@@ -297,10 +328,10 @@ async def internal_event(req: InternalEvent):
     if req.event:
         event = req.event
     elif req.event_type and req.payload:
-        event = {"type": req.event_type, **req.payload}
+        event = {"type": req.event_type, "payload": req.payload}
     else:
         return {"ok": False, "error": "no event data"}
-    run_id = event.get("run_id", "")
+    run_id = event.get("run_id", "") or (event.get("payload", {}).get("run_id", ""))
     await ws_broadcast(run_id, event)
     return {"ok": True}
 

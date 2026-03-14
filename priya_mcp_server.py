@@ -79,6 +79,7 @@ def _load_persona(persona: str) -> dict:
 async def _emit_event(event_type: str, payload: dict) -> None:
     """Fire-and-forget WS event via FastAPI internal endpoint."""
     try:
+        payload.setdefault("run_id", RUN_ID)
         async with httpx.AsyncClient(timeout=5.0) as client:
             await client.post(
                 f"{FASTAPI_INTERNAL}/event",
