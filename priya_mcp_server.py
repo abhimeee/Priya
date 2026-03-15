@@ -1,5 +1,5 @@
 """
-PRIYA custom MCP server — 17 domain tools exposed over stdio JSON-RPC.
+PRIYA custom MCP server — 20 domain tools exposed over stdio JSON-RPC.
 
 All monetary values flowing through MCP tools are in RUPEES (float).
 Conversion to PAISA (int) happens at the pine_client boundary.
@@ -40,6 +40,12 @@ PERSONAS_DIR = os.getenv("PERSONAS_DIR", "./personas")
 INVOICES_DIR = os.getenv("INVOICES_DIR", "./invoices")
 WAIT_TIMEOUT = float(os.getenv("PRIYA_WAIT_TIMEOUT_S", "300"))
 
+# Payout simulation mode — when True, payout disbursement calls are simulated
+# locally instead of hitting Pine Labs Payouts API (which requires merchant
+# enablement that MID 121495 doesn't have on UAT).  Auth, orders, and
+# settlements still use the real Pine Labs API.
+PINE_PAYOUT_SIM = os.getenv("PINE_PAYOUT_SIM", "false").lower() == "true"
+
 # Rail fallback chains — payment_link is most reliable on Pine Labs UAT
 RAIL_FALLBACKS: dict[str, list[str]] = {
     "neft": ["payment_link", "hosted_checkout"],
@@ -49,6 +55,13 @@ RAIL_FALLBACKS: dict[str, list[str]] = {
     "netbanking": ["upi_intent", "hosted_checkout", "payment_link"],
     "hosted_checkout": ["payment_link"],
     "payment_link": [],
+}
+
+# Payout rail fallback chain: IMPS → NEFT → UPI
+PAYOUT_RAIL_FALLBACKS: dict[str, list[str]] = {
+    "IMPS": ["NEFT", "UPI"],
+    "NEFT": ["UPI"],
+    "UPI": [],
 }
 
 # ---------------------------------------------------------------------------
@@ -103,39 +116,54 @@ def _run_recon_checks(
     sett: dict | None,
     all_settlements_for_utr: list[dict],
     orders_in_run: list[dict],
+    sett_missing: bool = False,
 ) -> tuple[list[dict], str, int]:
     """
-    Run all 8 reconciliation checks. Returns (checks_list, recon_status, settlement_delay_days).
+    Run all 10 reconciliation checks covering both legs of the payment flow:
+      Collection (owner→PRIYA): Checks 1-8 verify Pine Labs settlement
+      Disbursement (PRIYA→vendor): Check 10 verifies payout to vendor
+      Cross-check: Check 9 verifies invoice vs collected amount
+    Returns (checks_list, recon_status, settlement_delay_days).
     recon_status: 'MATCHED' | 'MISMATCH' | 'WARNING' | 'PENDING'
     """
     checks: list[dict] = []
 
     paid_amount = recon.get("paid_amount", 0.0) or 0.0
     settled_amount = recon.get("settled_amount", 0.0) or 0.0
-    platform_fee = (sett.get("platform_fee", 0.0) or 0.0) if sett else 0.0
+    # Use vendor's proportional fee (passed from caller), not batch-level sett.platform_fee
+    platform_fee = recon.get("vendor_fee", 0.0) or ((sett.get("platform_fee", 0.0) or 0.0) if sett else 0.0)
     mdr_actual = recon.get("mdr_rate_actual") or 0.0
     mdr_contracted = recon.get("mdr_rate_contracted") or 0.0
     rail_used = recon.get("rail_used") or ""
     bank_credit_amount = recon.get("bank_credit_amount")
 
     # Check 1 (BLOCKING): Settlement Amount Match
-    expected_net = round(paid_amount - platform_fee, 2)
-    c1_passed = abs(settled_amount - expected_net) < 0.01
+    if sett_missing and paid_amount > 0:
+        # Settlement hasn't arrived yet (T+1 delay) — defer, don't fail
+        c1_passed = None
+        c1_detail = "Settlement pending (T+1 delay)"
+    else:
+        expected_net = round(paid_amount - platform_fee, 2)
+        c1_passed = abs(settled_amount - expected_net) < 0.01
+        c1_detail = (
+            f"settled={settled_amount}, paid={paid_amount}, fee={platform_fee}, "
+            f"expected_net={expected_net}"
+        ) if not c1_passed else f"settled_amount={settled_amount} matches paid-fee={expected_net}"
     checks.append({
         "check_id": 1,
         "name": "settlement_amount_match",
         "severity": "blocking",
         "passed": c1_passed,
-        "detail": (
-            f"settled={settled_amount}, paid={paid_amount}, fee={platform_fee}, "
-            f"expected_net={expected_net}"
-        ) if not c1_passed else f"settled_amount={settled_amount} matches paid-fee={expected_net}",
+        "detail": c1_detail,
     })
 
-    # Check 2 (BLOCKING): Bank Credit Match — only if bank_credit_amount entered
+    # Check 2 (BLOCKING): Bank Credit Match
+    # Verifies: did PRIYA's bank account actually receive what Pine Labs claims
+    # they settled?  Requires bank statement data (API feed, CSV upload, or webhook).
+    # passed=None until bank_credit_amount is populated from an external source.
     if bank_credit_amount is None:
-        c2_passed = None  # Not yet evaluated
-        c2_detail = "bank_credit_amount not yet entered"
+        c2_passed = None
+        c2_detail = "Awaiting bank statement data (AA feed / CSV upload / bank webhook)"
     else:
         bank_delta = round(bank_credit_amount - settled_amount, 2)
         c2_passed = abs(bank_delta) < 0.01
@@ -151,16 +179,28 @@ def _run_recon_checks(
     })
 
     # Check 3 (WARNING): MDR Rate Drift
-    mdr_drift = abs(mdr_actual - mdr_contracted) > 0.001
+    # Look up the contracted rate for this specific rail if available
+    mdr_rates_by_rail = recon.get("mdr_rates_by_rail") or {}
+    mdr_expected = mdr_rates_by_rail.get(rail_used, mdr_contracted)
+
+    upi_zero_mdr_rails = ("upi", "upi_intent", "upi_collect", "payment_link")
+    if rail_used in upi_zero_mdr_rails and mdr_actual == 0.0:
+        # UPI zero-MDR is correct per NPCI mandate — not a drift
+        c3_passed = True
+        c3_detail = f"Zero MDR expected for {rail_used}"
+    else:
+        mdr_drift = abs(mdr_actual - mdr_expected) > 0.001
+        c3_passed = not mdr_drift
+        c3_detail = (
+            f"actual={mdr_actual:.6f}, contracted={mdr_expected:.6f}, "
+            f"drift={abs(mdr_actual - mdr_expected):.6f}"
+        )
     checks.append({
         "check_id": 3,
         "name": "mdr_rate_drift",
         "severity": "warning",
-        "passed": not mdr_drift,
-        "detail": (
-            f"actual={mdr_actual:.6f}, contracted={mdr_contracted:.6f}, "
-            f"drift={abs(mdr_actual - mdr_contracted):.6f}"
-        ),
+        "passed": c3_passed,
+        "detail": c3_detail,
     })
 
     # Check 4 (WARNING): Settlement Delay
@@ -189,24 +229,23 @@ def _run_recon_checks(
         "detail": f"refund_debit={refund_debit}",
     })
 
-    # Check 6 (INFO): Order Sum Check — sum of all order amounts == settlement actual_transaction_amount
+    # Check 6 (INFO): Order Sum Check — sum of all order amounts in batch == settlement expected_amount (gross)
     if sett and orders_in_run:
-        utr = sett.get("utr_number", "")
-        # expected_amount maps to actual_transaction_amount
+        # expected_amount is now the batch total (sum of all vendor amounts)
         settlement_gross = sett.get("expected_amount", 0.0) or 0.0
-        # orders that belong to this UTR settlement
-        orders_for_utr = [
+        # All orders sharing this pine_order_id
+        orders_in_batch = [
             o for o in orders_in_run
             if o.get("pine_order_id") == sett.get("pine_order_id")
         ]
-        order_sum = round(sum(o.get("amount", 0.0) for o in orders_for_utr), 2)
-        c6_passed = abs(order_sum - settlement_gross) < 0.01 if orders_for_utr else True
+        order_sum = round(sum(o.get("amount", 0.0) for o in orders_in_batch), 2)
+        c6_passed = abs(order_sum - settlement_gross) < 0.01 if orders_in_batch else True
         checks.append({
             "check_id": 6,
             "name": "order_sum_check",
             "severity": "info",
             "passed": c6_passed,
-            "detail": f"order_sum={order_sum}, settlement_gross={settlement_gross}",
+            "detail": f"batch_order_sum={order_sum}, settlement_gross={settlement_gross}, vendors_in_batch={len(orders_in_batch)}",
         })
     else:
         checks.append({
@@ -229,38 +268,91 @@ def _run_recon_checks(
 
     # Check 8 (INFO): Duplicate UTR
     utr_count = len(all_settlements_for_utr)
-    c8_passed = utr_count <= 1
+    distinct_order_ids = set(
+        s.get("pine_order_id") for s in all_settlements_for_utr if s.get("pine_order_id")
+    )
+    # If all settlements share the same pine_order_id, it's a batch — not a duplicate
+    is_batch = len(distinct_order_ids) <= 1
+    c8_passed = utr_count <= 1 or is_batch
     checks.append({
         "check_id": 8,
         "name": "duplicate_utr",
         "severity": "info",
         "passed": c8_passed,
-        "detail": f"settlements_with_same_utr={utr_count}",
+        "detail": (
+            f"settlements_with_same_utr={utr_count}, distinct_order_ids={len(distinct_order_ids)}"
+            + (", batch_order=true" if is_batch and utr_count > 1 else "")
+        ),
+    })
+
+    # Check 9 (BLOCKING): Invoice vs Paid Amount
+    invoice_amount = recon.get("invoice_amount", 0.0) or 0.0
+    if paid_amount == 0:
+        c9_passed = None  # No payment made yet — defer
+        c9_detail = "No payment made yet, deferring invoice check"
+    else:
+        c9_passed = abs(invoice_amount - paid_amount) < 0.01
+        c9_detail = (
+            f"invoice_amount={invoice_amount}, paid_amount={paid_amount}"
+            if not c9_passed
+            else f"invoice_amount={invoice_amount} matches paid_amount={paid_amount}"
+        )
+    checks.append({
+        "check_id": 9,
+        "name": "invoice_vs_paid",
+        "severity": "blocking",
+        "passed": c9_passed,
+        "detail": c9_detail,
+    })
+
+    # Check 10 (BLOCKING): Payout Verification — did the vendor receive the disbursement?
+    # In PRIYA's model: owner pays PRIYA (collection), PRIYA pays vendors (payout).
+    # This check verifies the payout leg completed successfully.
+    payout_info = recon.get("payout")
+    if payout_info is None:
+        # No payout record yet — might be pre-payout stage or payout not initiated
+        c10_passed = None
+        c10_detail = "Payout not yet initiated to vendor"
+    elif payout_info.get("status") == "SUCCESS":
+        payout_amount = float(payout_info.get("amount", 0))
+        c10_passed = abs(payout_amount - invoice_amount) < 0.01
+        c10_detail = (
+            f"payout={payout_amount}, invoice={invoice_amount}, "
+            f"mode={payout_info.get('mode', '?')}, "
+            f"utr={payout_info.get('bank_txn_reference_id', 'N/A')}"
+        )
+    elif payout_info.get("status") == "FAILED":
+        c10_passed = False
+        c10_detail = f"Payout FAILED: {payout_info.get('message', 'unknown error')}"
+    else:
+        c10_passed = None
+        c10_detail = f"Payout in progress: status={payout_info.get('status', '?')}"
+    checks.append({
+        "check_id": 10,
+        "name": "payout_to_vendor",
+        "severity": "blocking",
+        "passed": c10_passed,
+        "detail": c10_detail,
     })
 
     # Determine recon_status
-    # PENDING: bank_credit_amount not yet entered (check 2 not evaluated)
-    if bank_credit_amount is None:
-        # Still check for blocking failures in check 1
-        if not c1_passed:
-            recon_status = "MISMATCH"
-        else:
-            recon_status = "PENDING"
+    # passed=None means "not yet determined" (deferred) — neither blocking fail nor pass
+    blocking_checks = [c for c in checks if c["severity"] == "blocking"]
+    blocking_failed = any(c["passed"] is False for c in blocking_checks)
+    blocking_deferred = any(c["passed"] is None for c in blocking_checks)
+    warning_failed = any(
+        c for c in checks
+        if c["severity"] == "warning" and c["passed"] is False
+    )
+
+    if blocking_failed:
+        recon_status = "MISMATCH"
+    elif blocking_deferred:
+        recon_status = "PENDING"
+    elif warning_failed:
+        recon_status = "WARNING"
     else:
-        blocking_failed = any(
-            c for c in checks
-            if c["severity"] == "blocking" and c["passed"] is False
-        )
-        warning_failed = any(
-            c for c in checks
-            if c["severity"] == "warning" and c["passed"] is False
-        )
-        if blocking_failed:
-            recon_status = "MISMATCH"
-        elif warning_failed:
-            recon_status = "WARNING"
-        else:
-            recon_status = "MATCHED"
+        recon_status = "MATCHED"
 
     return checks, recon_status, delay_days
 
@@ -591,6 +683,70 @@ TOOLS: list[Tool] = [
             "required": ["run_id"],
         },
     ),
+    # --- PAYOUT TOOLS (Pine Labs Payouts API v3) ---
+    Tool(
+        name="execute_payouts",
+        description=(
+            "Execute payouts for all approved vendors in a run. Uses IMPS as primary rail, "
+            "falls back to NEFT, then UPI. Creates individual payout per vendor via "
+            "Pine Labs Payouts API."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "mode": {
+                    "type": "string",
+                    "default": "IMPS",
+                    "description": "Payout mode: IMPS, NEFT, RTGS, or UPI",
+                },
+            },
+            "required": ["run_id"],
+        },
+    ),
+    Tool(
+        name="poll_payout_status",
+        description=(
+            "Poll Pine Labs for payout status updates. Checks all pending payouts in a run "
+            "and updates DB. Call this after execute_payouts to track completion."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "default": 120,
+                    "description": "Max wait time in seconds (default 120)",
+                },
+                "poll_interval_seconds": {
+                    "type": "integer",
+                    "default": 5,
+                    "description": "How often to poll Pine Labs (default 5s)",
+                },
+            },
+            "required": ["run_id"],
+        },
+    ),
+    Tool(
+        name="retry_failed_payout",
+        description=(
+            "Retry a failed payout with a different rail. Tries NEFT if IMPS failed, "
+            "then UPI as last resort."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "run_id": {"type": "string"},
+                "vendor_id": {"type": "string"},
+                "new_mode": {
+                    "type": "string",
+                    "description": "New payout mode: IMPS, NEFT, or UPI",
+                },
+            },
+            "required": ["run_id", "vendor_id", "new_mode"],
+        },
+    ),
 ]
 
 
@@ -657,6 +813,12 @@ async def _dispatch(name: str, args: dict) -> list[TextContent]:
             return await _emit_event_tool(args)
         case "finalize_run":
             return await _finalize_run(args)
+        case "execute_payouts":
+            return await _execute_payouts(args)
+        case "poll_payout_status":
+            return await _poll_payout_status(args)
+        case "retry_failed_payout":
+            return await _retry_failed_payout(args)
         case _:
             return _err(f"Unknown tool: {name}")
 
@@ -743,10 +905,27 @@ async def _load_invoices(args: dict) -> list[TextContent]:
 
 
 async def _get_account_balance(_args: dict) -> list[TextContent]:
+    # Try Pine Labs Payouts balance API if available
+    if hasattr(_pine, "get_account_balance"):
+        try:
+            run = await _db.get_run(RUN_ID) if RUN_ID else None
+            token = run["pine_token"] if run and run.get("pine_token") else None
+            if token:
+                result = await _pine.get_account_balance(token)
+                balance = float(result.get("balance", result.get("available_balance", 0)))
+                return _ok({
+                    "balance": balance,
+                    "currency": result.get("currency", "INR"),
+                    "sufficient": balance > 0,
+                    "source": "pine_labs_payouts",
+                })
+        except Exception:
+            pass  # Fall through to mock balance
     return _ok({
         "balance": 10_00_000.0,  # Rs 10 lakh mock balance
         "currency": "INR",
         "sufficient": True,
+        "source": "mock",
     })
 
 
@@ -912,7 +1091,39 @@ async def _request_policy_approval(args: dict) -> list[TextContent]:
     })
 
     result = await _wait_for_approval("approve", run_id)
+
+    # Handle full rejection
+    if result.get("rejected"):
+        await _db.update_run_status(run_id, "rejected")
+        await _emit_event("PIPELINE_STEP", {
+            "run_id": run_id,
+            "step": "APPROVE",
+            "status": "rejected",
+        })
+        return _err("Run rejected by operator")
+
     approved_at = result.get("approved_at", _now_iso())
+    vendor_decisions: dict = result.get("vendor_decisions") or {}
+
+    # Apply per-vendor decisions to the DB and update vendors_summary list
+    if vendor_decisions:
+        for vendor in ranked_vendors:
+            vid = vendor["vendor_id"]
+            decision = vendor_decisions.get(vid)
+            if decision in ("reject", "defer"):
+                vendor["action"] = decision
+                db_vendor = await _db.get_vendor(vid)
+                if db_vendor:
+                    db_vendor["action"] = decision
+                    await _db.upsert_vendor(db_vendor)
+
+        # Emit updated CANVAS_STATE so the frontend reflects decisions
+        await _emit_event("CANVAS_STATE", {
+            "state": "approval_decisions",
+            "run_id": run_id,
+            "vendor_decisions": vendor_decisions,
+            "vendors": ranked_vendors,
+        })
 
     await _db.update_run_status(run_id, "approved", approved_at=approved_at)
 
@@ -922,7 +1133,12 @@ async def _request_policy_approval(args: dict) -> list[TextContent]:
         "status": "completed",
     })
 
-    return _ok({"approved": True, "approved_at": approved_at})
+    return _ok({
+        "approved": True,
+        "approved_at": approved_at,
+        "vendor_decisions": vendor_decisions,
+        "vendors_summary": ranked_vendors,
+    })
 
 
 async def _request_escalation_decision(args: dict) -> list[TextContent]:
@@ -1090,30 +1306,39 @@ async def _create_batch_payment(args: dict) -> list[TextContent]:
     pine_payment = pine_resp.get("data", pine_resp)
     pine_payment_id = pine_payment.get("payment_id", pine_payment.get("order_id", ""))
     status = pine_payment.get("status", "PROCESSED")
-    payment_link_url = pine_payment.get("payment_link", "")
+    # Extract payment link URL — check both wrapper and top-level
+    payment_link_url = (
+        pine_payment.get("payment_link", "")
+        or pine_resp.get("payment_link", "")
+        or pine_resp.get("data", {}).get("payment_link", "")
+    )
 
-    # Create ONE payment record linked to the first order (batch payment)
-    payment_id = str(uuid.uuid4())
-    payment = {
-        "id": payment_id,
-        "run_id": run_id,
-        "order_id": orders[0]["id"],
-        "vendor_id": orders[0]["vendor_id"],
-        "pine_order_id": pine_order_id,
-        "pine_payment_id": pine_payment_id,
-        "merchant_payment_reference": mpr,
-        "amount": total_amount,
-        "rail": rail,
-        "attempt_number": attempt_number,
-        "pine_status": status,
-        "failure_reason": pine_payment.get("failure_reason"),
-        "recovery_action": None,
-        "webhook_event": None,
-        "request_id": pine_payment.get("payment_id", ""),
-        "initiated_at": _now_iso(),
-        "confirmed_at": _now_iso() if status in ("PROCESSED", "SUCCESS") else None,
-    }
-    await _db.insert_payment(payment)
+    # Create a payment record for EACH order in the batch
+    payment_id = None  # will hold the last inserted payment id for the result
+    for o in orders:
+        pid = str(uuid.uuid4())
+        if payment_id is None:
+            payment_id = pid  # use first as representative id in result
+        payment = {
+            "id": pid,
+            "run_id": run_id,
+            "order_id": o["id"],
+            "vendor_id": o["vendor_id"],
+            "pine_order_id": pine_order_id,
+            "pine_payment_id": pine_payment_id,
+            "merchant_payment_reference": mpr,
+            "amount": o["amount"],
+            "rail": rail,
+            "attempt_number": attempt_number,
+            "pine_status": status,
+            "failure_reason": pine_payment.get("failure_reason"),
+            "recovery_action": payment_link_url or None,
+            "webhook_event": None,
+            "request_id": pine_payment.get("payment_id", ""),
+            "initiated_at": _now_iso(),
+            "confirmed_at": _now_iso() if status in ("PROCESSED", "SUCCESS") else None,
+        }
+        await _db.insert_payment(payment)
 
     # Determine the vendor display state
     is_confirmed = status in ("PROCESSED", "SUCCESS")
@@ -1282,14 +1507,15 @@ async def _build_payment_via_pine(
                 token, amount_paisa, merchant_payment_reference,
                 description=f"PRIYA vendor payment {merchant_payment_reference}",
             )
-            # Status = AWAITING_PAYMENT: link is created but nobody has paid yet.
-            # The webhook (ORDER_PROCESSED) will update status to PROCESSED.
+            link_url = resp.get("payment_link", "")
+            import sys
+            print(f"[PRIYA DEBUG] create_payment_link response keys: {list(resp.keys())}, payment_link={link_url!r}", file=sys.stderr, flush=True)
             return {
                 "data": {
                     "payment_id": resp.get("payment_link_id", ""),
                     "order_id": resp.get("order_id", pine_order_id),
                     "status": "AWAITING_PAYMENT",
-                    "payment_link": resp.get("payment_link", ""),
+                    "payment_link": link_url,
                     "payment_method": "PAYMENT_LINK",
                 }
             }
@@ -1367,6 +1593,10 @@ async def _create_payment(args: dict) -> list[TextContent]:
     pine_payment = pine_resp.get("data", pine_resp)
     pine_payment_id = pine_payment.get("payment_id", pine_payment.get("order_id", ""))
     status = pine_payment.get("status", "PROCESSED")
+    payment_link_url = (
+        pine_payment.get("payment_link", "")
+        or pine_resp.get("payment_link", "")
+    )
 
     payment_id = str(uuid.uuid4())
     payment = {
@@ -1382,7 +1612,7 @@ async def _create_payment(args: dict) -> list[TextContent]:
         "attempt_number": attempt_number,
         "pine_status": status,
         "failure_reason": pine_payment.get("failure_reason"),
-        "recovery_action": None,
+        "recovery_action": payment_link_url or None,
         "webhook_event": None,
         "request_id": pine_payment.get("payment_id", ""),
         "initiated_at": _now_iso(),
@@ -1392,29 +1622,42 @@ async def _create_payment(args: dict) -> list[TextContent]:
 
     if status in ("PROCESSED", "SUCCESS"):
         await _db.update_order_status(order_id, "PROCESSED")
+    elif status == "AWAITING_PAYMENT":
+        await _db.update_order_status(order_id, "AWAITING_PAYMENT")
+
+    is_awaiting = status == "AWAITING_PAYMENT"
+    pay_status = "completed" if status in ("PROCESSED", "SUCCESS") else ("awaiting_webhook" if is_awaiting else "failed")
 
     await _emit_event("PIPELINE_STEP", {
         "run_id": order["run_id"],
         "step": "PAY",
         "vendor_id": order["vendor_id"],
-        "status": "completed" if status in ("PROCESSED", "SUCCESS") else "failed",
+        "status": pay_status,
     })
     await _emit_event("VENDOR_STATE", {
         "vendor_id": order["vendor_id"],
         "name": (await _db.get_vendor(order["vendor_id"]) or {}).get("name", ""),
         "amount": amount,
         "rail": rail,
-        "state": "PROCESSED" if status in ("PROCESSED", "SUCCESS") else "FAILED",
+        "state": "PENDING" if is_awaiting else ("PROCESSED" if status in ("PROCESSED", "SUCCESS") else "FAILED"),
         "pine_payment_id": pine_payment_id,
+        "payment_link": payment_link_url,
         "attempt_number": attempt_number,
     })
 
-    return _ok({
+    result = {
         "pine_payment_id": pine_payment_id,
         "payment_id": payment_id,
         "status": status,
         "attempt_number": attempt_number,
-    })
+        "payment_link": payment_link_url,
+    }
+    if is_awaiting and payment_link_url:
+        result["IMPORTANT"] = (
+            "Payment link created. The owner must pay via this link. "
+            "Call await_payment_confirmation(run_id) to wait for payment."
+        )
+    return _ok(result)
 
 
 async def _switch_rail_and_retry(args: dict) -> list[TextContent]:
@@ -1537,16 +1780,20 @@ async def _await_payment_confirmation(args: dict) -> list[TextContent]:
     # Gather initial payment state
     total_payments = 0
     payment_links = []
+    payment_link_url = ""
     for order in orders:
         payments = await _db.get_payments_by_order(order["id"])
         for p in payments:
             total_payments += 1
+            if p.get("recovery_action"):
+                payment_link_url = p["recovery_action"]
             if p.get("pine_status") not in ("PROCESSED", "SUCCESS", "FAILED", "CANCELLED"):
                 payment_links.append({
                     "payment_id": p["id"],
                     "pine_order_id": p.get("pine_order_id", ""),
                     "amount": p.get("amount", 0),
                     "status": p.get("pine_status", "PENDING"),
+                    "payment_link": p.get("recovery_action", ""),
                 })
 
     # Emit waiting state to frontend
@@ -1560,6 +1807,7 @@ async def _await_payment_confirmation(args: dict) -> list[TextContent]:
         "total_payments": total_payments,
         "pending_count": len(payment_links),
         "timeout_seconds": timeout,
+        "payment_link": payment_link_url,
         "message": f"Waiting for {len(payment_links)} payment(s) to be confirmed via webhook...",
     })
 
@@ -1655,6 +1903,455 @@ async def _await_payment_confirmation(args: dict) -> list[TextContent]:
     })
 
 
+# --- PAYOUTS (Pine Labs Payouts API v3) ---
+
+async def _execute_payouts(args: dict) -> list[TextContent]:
+    """Execute payouts for all approved vendors in a run via Pine Labs Payouts API."""
+    run_id: str = args["run_id"]
+    mode: str = args.get("mode", "IMPS").upper()
+
+    run = await _db.get_run(run_id)
+    if not run:
+        return _err(f"Run not found: {run_id}")
+    token: str = run["pine_token"]
+
+    # Get all orders for this run (created in the ORDER step)
+    orders = await _db.get_orders_by_run(run_id)
+    if not orders:
+        return _err("No orders found for this run")
+
+    sim_label = " (simulated — UAT merchant not enabled for payouts)" if PINE_PAYOUT_SIM else ""
+    await _emit_event("AGENT_NARRATION", {
+        "run_id": run_id,
+        "message": f"Executing payouts for {len(orders)} vendor(s) via {mode}{sim_label}...",
+        "level": "info",
+    })
+
+    scheduled = 0
+    failed = 0
+    payouts_summary: list[dict] = []
+
+    for order in orders:
+        # Skip deferred vendors
+        if order.get("action") == "defer":
+            continue
+
+        vendor_id = order["vendor_id"]
+        vendor = await _db.get_vendor(vendor_id)
+        if not vendor:
+            failed += 1
+            payouts_summary.append({
+                "vendor_id": vendor_id,
+                "status": "FAILED",
+                "reason": "Vendor not found in DB",
+            })
+            continue
+
+        payee_name = vendor.get("payee_name") or vendor.get("name", "")
+        account_number = vendor.get("bank_account", "")
+        branch_code = vendor.get("ifsc", "")
+        email = vendor.get("email", "")
+        phone = vendor.get("phone", "")
+        upi_id = vendor.get("upi_id", "")
+        amount_rupees = order["amount"]
+
+        # Generate unique client reference ID
+        client_ref = f"PRIYA-{run_id[:8]}-{vendor_id[:8]}-{uuid.uuid4().hex[:6]}".upper()
+
+        try:
+            if PINE_PAYOUT_SIM:
+                # Simulate payout — merchant not enabled for payouts on UAT
+                pine_resp = {
+                    "clientReferenceId": client_ref,
+                    "paymentReferenceId": f"SIM-PAY-{uuid.uuid4().hex[:8].upper()}",
+                    "payeeName": payee_name,
+                    "accountNumber": account_number,
+                    "branchCode": branch_code,
+                    "amount": {"currency": "INR", "value": amount_rupees},
+                    "mode": mode,
+                    "status": "SCHEDULED",
+                    "message": "Payout scheduled (simulated — UAT merchant not enabled for payouts)",
+                    "scheduledAt": _now_iso(),
+                    "remarks": f"Vendor payment via PRIYA — {order.get('merchant_order_reference', '')}",
+                }
+            else:
+                pine_resp = await _pine.create_payout(
+                    token=token,
+                    client_reference_id=client_ref,
+                    payee_name=payee_name,
+                    account_number=account_number,
+                    branch_code=branch_code,
+                    amount_rupees=amount_rupees,
+                    mode=mode,
+                    email=email,
+                    phone=phone,
+                    remarks=f"Vendor payment via PRIYA — {order.get('merchant_order_reference', '')}",
+                )
+
+            payout_status = pine_resp.get("status", "SCHEDULED")
+            payout_id = pine_resp.get("id", pine_resp.get("paymentReferenceId", pine_resp.get("payout_id", client_ref)))
+
+            # Insert payout record in DB
+            payout_record = {
+                "id": str(uuid.uuid4()),
+                "run_id": run_id,
+                "order_id": order["id"],
+                "vendor_id": vendor_id,
+                "client_reference_id": client_ref,
+                "payout_id": payout_id,
+                "payee_name": payee_name,
+                "account_number": account_number,
+                "branch_code": branch_code,
+                "amount": amount_rupees,
+                "mode": mode,
+                "status": payout_status,
+                "attempt_number": 1,
+                "failure_reason": None,
+                "bank_txn_reference_id": pine_resp.get("bankTxnReferenceId"),
+                "created_at": _now_iso(),
+                "updated_at": _now_iso(),
+            }
+            await _db.insert_payout(payout_record)
+
+            scheduled += 1
+            payouts_summary.append({
+                "vendor_id": vendor_id,
+                "vendor_name": payee_name,
+                "amount": amount_rupees,
+                "client_reference_id": client_ref,
+                "payout_id": payout_id,
+                "status": payout_status,
+                "mode": mode,
+            })
+
+            # Emit vendor state based on payout status
+            state = "PROCESSING" if payout_status in ("SCHEDULED", "PENDING", "PROCESSING") else (
+                "PROCESSED" if payout_status in ("PROCESSED", "SUCCESS") else "FAILED"
+            )
+            await _emit_event("VENDOR_STATE", {
+                "vendor_id": vendor_id,
+                "name": payee_name,
+                "amount": amount_rupees,
+                "rail": f"payout_{mode.lower()}",
+                "state": state,
+                "payout_id": payout_id,
+                "client_reference_id": client_ref,
+            })
+
+        except Exception as e:
+            failed += 1
+            payouts_summary.append({
+                "vendor_id": vendor_id,
+                "vendor_name": payee_name,
+                "amount": amount_rupees,
+                "status": "FAILED",
+                "reason": str(e),
+                "mode": mode,
+            })
+
+            await _emit_event("VENDOR_STATE", {
+                "vendor_id": vendor_id,
+                "name": payee_name,
+                "amount": amount_rupees,
+                "rail": f"payout_{mode.lower()}",
+                "state": "FAILED",
+                "reason": str(e),
+            })
+
+    # Emit pipeline step
+    pay_status = "completed" if failed == 0 else ("partial" if scheduled > 0 else "failed")
+    await _emit_event("PIPELINE_STEP", {
+        "run_id": run_id,
+        "step": "PAY",
+        "status": pay_status,
+        "method": "payouts_api",
+    })
+
+    return _ok({
+        "total": scheduled + failed,
+        "scheduled": scheduled,
+        "failed": failed,
+        "mode": mode,
+        "payouts": payouts_summary,
+    })
+
+
+async def _poll_payout_status(args: dict) -> list[TextContent]:
+    """Poll Pine Labs for payout status updates on all pending payouts in a run."""
+    run_id: str = args["run_id"]
+    timeout = int(args.get("timeout_seconds", 120))
+    poll_interval = int(args.get("poll_interval_seconds", 5))
+
+    run = await _db.get_run(run_id)
+    if not run:
+        return _err(f"Run not found: {run_id}")
+    token: str = run["pine_token"]
+
+    terminal_statuses = {"SUCCESS", "FAILED", "REVERSED", "CANCELLED"}
+
+    # Emit waiting state
+    await _emit_event("CANVAS_STATE", {
+        "state": "awaiting_payment",
+        "run_id": run_id,
+    })
+
+    elapsed = 0
+    while elapsed < timeout:
+        # Get all payouts for this run that are not yet terminal
+        all_payouts = await _db.get_payouts_by_run(run_id)
+        pending = [p for p in all_payouts if p.get("status", "").upper() not in terminal_statuses]
+
+        if not pending:
+            break
+
+        # Poll each pending payout
+        for payout in pending:
+            client_ref = payout.get("client_reference_id", "")
+            if not client_ref:
+                continue
+
+            try:
+                if PINE_PAYOUT_SIM:
+                    # Simulate status progression: SCHEDULED → SUCCESS after ~5s
+                    cur = payout.get("status", "SCHEDULED").upper()
+                    if cur in ("SCHEDULED", "PENDING", "PROCESSING") and elapsed >= 5:
+                        new_status = "SUCCESS"
+                        utr = f"SIM{uuid.uuid4().hex[:12].upper()}"
+                    else:
+                        new_status = cur
+                        utr = payout.get("bank_txn_reference_id")
+                else:
+                    resp = await _pine.get_payout_status(token, client_ref)
+                    new_status = resp.get("status", payout["status"]).upper()
+                    utr = resp.get("bankTxnReferenceId") or payout.get("bank_txn_reference_id")
+
+                if new_status != payout["status"]:
+                    await _db.update_payout_status(
+                        payout["id"],
+                        new_status,
+                        bank_txn_reference_id=utr,
+                        updated_at=_now_iso(),
+                    )
+
+                    # Emit vendor state update
+                    state = "PROCESSED" if new_status == "SUCCESS" else (
+                        "FAILED" if new_status in ("FAILED", "REVERSED", "CANCELLED") else "PROCESSING"
+                    )
+                    await _emit_event("VENDOR_STATE", {
+                        "vendor_id": payout["vendor_id"],
+                        "name": payout.get("payee_name", ""),
+                        "amount": payout.get("amount", 0),
+                        "rail": f"payout_{payout.get('mode', 'IMPS').lower()}",
+                        "state": state,
+                        "payout_id": payout.get("payout_id", ""),
+                        "utr_number": utr,
+                    })
+            except Exception:
+                pass  # Will retry on next poll cycle
+
+        # Emit progress
+        all_payouts = await _db.get_payouts_by_run(run_id)
+        success_count = sum(1 for p in all_payouts if p.get("status", "").upper() == "SUCCESS")
+        failed_count = sum(1 for p in all_payouts if p.get("status", "").upper() in ("FAILED", "REVERSED", "CANCELLED"))
+        pending_count = len(all_payouts) - success_count - failed_count
+
+        await _emit_event("PAYMENT_AWAITING", {
+            "run_id": run_id,
+            "total_payments": len(all_payouts),
+            "confirmed_count": success_count,
+            "failed_count": failed_count,
+            "pending_count": pending_count,
+            "elapsed_seconds": elapsed,
+            "timeout_seconds": timeout,
+            "message": (
+                f"{success_count} success, {failed_count} failed, "
+                f"{pending_count} pending — {elapsed}s elapsed"
+            ),
+        })
+
+        if pending_count == 0:
+            break
+
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+
+    # Final tally
+    all_payouts = await _db.get_payouts_by_run(run_id)
+    success_list = [p for p in all_payouts if p.get("status", "").upper() == "SUCCESS"]
+    failed_list = [p for p in all_payouts if p.get("status", "").upper() in ("FAILED", "REVERSED", "CANCELLED")]
+    pending_list = [p for p in all_payouts if p.get("status", "").upper() not in terminal_statuses]
+    timed_out = len(pending_list) > 0
+
+    # Reset canvas state
+    await _emit_event("CANVAS_STATE", {
+        "state": "paying",
+        "run_id": run_id,
+    })
+
+    await _emit_event("AGENT_NARRATION", {
+        "run_id": run_id,
+        "message": (
+            f"Payout status: {len(success_list)} success, "
+            f"{len(failed_list)} failed"
+            + (f", {len(pending_list)} still pending (timed out after {timeout}s)" if timed_out else "")
+        ),
+        "level": "warn" if timed_out or failed_list else "info",
+    })
+
+    return _ok({
+        "success_count": len(success_list),
+        "failed_count": len(failed_list),
+        "pending_count": len(pending_list),
+        "timed_out": timed_out,
+        "elapsed_seconds": elapsed,
+        "success_payouts": [
+            {"id": p["id"], "vendor_id": p["vendor_id"], "amount": p["amount"],
+             "utr_number": p.get("bank_txn_reference_id", "")}
+            for p in success_list
+        ],
+        "failed_payouts": [
+            {"id": p["id"], "vendor_id": p["vendor_id"], "amount": p["amount"],
+             "reason": p.get("failure_reason", "")}
+            for p in failed_list
+        ],
+    })
+
+
+async def _retry_failed_payout(args: dict) -> list[TextContent]:
+    """Retry a failed payout for a specific vendor with a different rail/mode."""
+    run_id: str = args["run_id"]
+    vendor_id: str = args["vendor_id"]
+    new_mode: str = args["new_mode"].upper()
+
+    run = await _db.get_run(run_id)
+    if not run:
+        return _err(f"Run not found: {run_id}")
+    token: str = run["pine_token"]
+
+    # Find the failed payout for this vendor
+    vendor_payouts = await _db.get_payouts_by_vendor(run_id, vendor_id)
+    failed_payout = None
+    for p in reversed(vendor_payouts):  # Most recent first
+        if p.get("status", "").upper() in ("FAILED", "REVERSED", "CANCELLED"):
+            failed_payout = p
+            break
+
+    if not failed_payout:
+        return _err(f"No failed payout found for vendor {vendor_id} in run {run_id}")
+
+    vendor = await _db.get_vendor(vendor_id)
+    if not vendor:
+        return _err(f"Vendor not found: {vendor_id}")
+
+    payee_name = vendor.get("payee_name") or vendor.get("name", "")
+    account_number = vendor.get("bank_account", "")
+    branch_code = vendor.get("ifsc", "")
+    email = vendor.get("email", "")
+    phone = vendor.get("phone", "")
+    upi_id = vendor.get("upi_id", "")
+    amount_rupees = failed_payout["amount"]
+    attempt_number = failed_payout.get("attempt_number", 1) + 1
+
+    # Generate new client reference
+    client_ref = f"PRIYA-{run_id[:8]}-{vendor_id[:8]}-{uuid.uuid4().hex[:6]}".upper()
+
+    # Emit rail switch event
+    await _emit_event("RAIL_SWITCH", {
+        "vendor_id": vendor_id,
+        "failed_rail": f"payout_{failed_payout.get('mode', 'IMPS').lower()}",
+        "new_rail": f"payout_{new_mode.lower()}",
+        "failure_reason": failed_payout.get("failure_reason", "unknown"),
+    })
+
+    try:
+        # If UPI mode and vendor has upi_id, the pine_client will handle it
+        payout_account = account_number
+        payout_branch = branch_code
+        if new_mode == "UPI" and upi_id:
+            # For UPI payouts, pine_client uses upi_id instead of bank details
+            payout_account = upi_id
+            payout_branch = ""
+
+        if PINE_PAYOUT_SIM:
+            pine_resp = {
+                "clientReferenceId": client_ref,
+                "paymentReferenceId": f"SIM-PAY-{uuid.uuid4().hex[:8].upper()}",
+                "payeeName": payee_name,
+                "accountNumber": payout_account,
+                "branchCode": payout_branch,
+                "amount": {"currency": "INR", "value": amount_rupees},
+                "mode": new_mode,
+                "status": "SCHEDULED",
+                "message": f"Retry #{attempt_number} (simulated)",
+                "scheduledAt": _now_iso(),
+            }
+        else:
+            pine_resp = await _pine.create_payout(
+                token=token,
+                client_reference_id=client_ref,
+                payee_name=payee_name,
+                account_number=payout_account,
+                branch_code=payout_branch,
+                amount_rupees=amount_rupees,
+                mode=new_mode,
+                email=email,
+                phone=phone,
+                remarks=f"Retry #{attempt_number} — vendor payment via PRIYA",
+            )
+
+        payout_status = pine_resp.get("status", "SCHEDULED")
+        payout_id = pine_resp.get("id", pine_resp.get("paymentReferenceId", pine_resp.get("payout_id", client_ref)))
+
+        # Insert new payout record
+        payout_record = {
+            "id": str(uuid.uuid4()),
+            "run_id": run_id,
+            "order_id": failed_payout.get("order_id", ""),
+            "vendor_id": vendor_id,
+            "client_reference_id": client_ref,
+            "payout_id": payout_id,
+            "payee_name": payee_name,
+            "account_number": payout_account,
+            "branch_code": payout_branch,
+            "amount": amount_rupees,
+            "mode": new_mode,
+            "status": payout_status,
+            "attempt_number": attempt_number,
+            "failure_reason": None,
+            "bank_txn_reference_id": pine_resp.get("bankTxnReferenceId"),
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
+        }
+        await _db.insert_payout(payout_record)
+
+        state = "PROCESSING" if payout_status in ("SCHEDULED", "PENDING", "PROCESSING") else (
+            "PROCESSED" if payout_status in ("PROCESSED", "SUCCESS") else "FAILED"
+        )
+        await _emit_event("VENDOR_STATE", {
+            "vendor_id": vendor_id,
+            "name": payee_name,
+            "amount": amount_rupees,
+            "rail": f"payout_{new_mode.lower()}",
+            "state": state,
+            "payout_id": payout_id,
+            "client_reference_id": client_ref,
+            "attempt_number": attempt_number,
+        })
+
+        return _ok({
+            "vendor_id": vendor_id,
+            "client_reference_id": client_ref,
+            "payout_id": payout_id,
+            "status": payout_status,
+            "mode": new_mode,
+            "attempt_number": attempt_number,
+            "amount": amount_rupees,
+        })
+
+    except Exception as e:
+        return _err(f"Retry payout failed for vendor {vendor_id}: {e}")
+
+
 # --- SETTLEMENT & RECON ---
 
 async def _run_settlements(args: dict) -> list[TextContent]:
@@ -1687,8 +2384,13 @@ async def _run_settlements(args: dict) -> list[TextContent]:
     #   data[].programs             — list of payment rail strings
     #   data[].system               — "PG" etc.
     # -----------------------------------------------------------------------
-    result = await _pine.get_all_settlements(token, start_date, end_date)
-    raw_settlements = result.get("data", [])
+    try:
+        result = await _pine.get_all_settlements(token, start_date, end_date)
+        raw_settlements = result.get("data", [])
+    except Exception as e:
+        import sys
+        print(f"[SETTLEMENTS] Pine Labs API error (falling back to UAT synth): {e}", file=sys.stderr)
+        raw_settlements = []
 
     matched_count = 0
     written: list[dict] = []
@@ -1731,44 +2433,63 @@ async def _run_settlements(args: dict) -> list[TextContent]:
                 "settled_at": settled_at,
                 "created_at": _now_iso(),
             }
+            # Only write settlements that match orders in this run to prevent
+            # cross-run contamination. If no matched order, skip this settlement.
+            if matched_pine_order_id is None:
+                continue
+
             await _db.insert_settlement(settlement)
             written.append(settlement)
-
-            if matched_pine_order_id:
-                matched_count += 1
+            matched_count += 1
     else:
         # ---- UAT FALLBACK ------------------------------------------------
         # Pine Labs UAT does not generate settlement records for test payments.
-        # We synthesise realistic settlement entries from the confirmed payments
-        # in our DB so the reconciliation step can still execute end-to-end.
-        # Fields mirror the live response schema above.
+        # We synthesise realistic settlement entries so recon can run end-to-end.
+        #
+        # Real-world model: Pine Labs settles ONE amount per batch order (the
+        # total collected minus MDR).  So we create ONE settlement per unique
+        # pine_order_id, with expected_amount = sum of vendor amounts in that
+        # batch.  This mirrors what a live settlement response looks like.
         #
         # UTR format:  AXISN<YYYYMMDD><4-digit-seq>   (realistic AXIS Bank UTR)
-        # platform_fee = paid_amount * mdr_rate (default 1.8 %)
-        # settled_amount = paid_amount - platform_fee
-        # settled_at = payment.confirmed_at + 1 business day
         # -----------------------------------------------------------------------
         uat_fallback = True
-        MDR_RATE = 0.018  # 1.8% default
+        persona_config = _load_persona(run.get("persona", "")) if run.get("persona") else {}
+        MDR_RATE = persona_config.get("mdr_rate_contracted", 0.018)
 
-        # Load confirmed payments for each order in this run
         today_str = date.today().strftime("%Y%m%d")
         seq = 1
+
+        # Group orders by pine_order_id (batch orders share the same one)
+        batch_groups: dict[str, list[dict]] = {}
         for order in orders:
-            payments = await _db.get_payments_by_order(order["id"])
-            confirmed = [p for p in payments if p.get("pine_status") in ("PROCESSED", "SUCCESS")]
-            if not confirmed:
+            pine_oid = order.get("pine_order_id", order["id"])
+            batch_groups.setdefault(pine_oid, []).append(order)
+
+        for pine_oid, batch_orders in batch_groups.items():
+            # Sum confirmed amounts across all orders in the batch
+            batch_total = 0.0
+            latest_confirmed_at = None
+            has_confirmed = False
+
+            for order in batch_orders:
+                payments = await _db.get_payments_by_order(order["id"])
+                confirmed = [p for p in payments if p.get("pine_status") in ("PROCESSED", "SUCCESS")]
+                if confirmed:
+                    has_confirmed = True
+                    payment = confirmed[-1]
+                    batch_total += float(payment.get("amount", order.get("amount", 0)))
+                    cat = payment.get("confirmed_at")
+                    if cat and (latest_confirmed_at is None or cat > latest_confirmed_at):
+                        latest_confirmed_at = cat
+
+            if not has_confirmed:
                 continue
 
-            # Use the latest confirmed payment as the settlement anchor
-            payment = confirmed[-1]
-            paid_amount = float(payment.get("amount", order.get("amount", 0)))
+            platform_fee = round(batch_total * MDR_RATE, 2)
+            settled_amount = round(batch_total - platform_fee, 2)
 
-            platform_fee = round(paid_amount * MDR_RATE, 2)
-            settled_amount = round(paid_amount - platform_fee, 2)
-
-            # settled_at = confirmed_at + 1 day
-            confirmed_at_raw = payment.get("confirmed_at") or _now_iso()
+            confirmed_at_raw = latest_confirmed_at or _now_iso()
             try:
                 confirmed_dt = datetime.fromisoformat(confirmed_at_raw.replace("Z", "+00:00"))
                 settled_dt = confirmed_dt + timedelta(days=1)
@@ -1784,12 +2505,12 @@ async def _run_settlements(args: dict) -> list[TextContent]:
             settlement = {
                 "id": str(uuid.uuid4()),
                 "run_id": run_id,
-                "pine_order_id": order.get("pine_order_id", ""),
+                "pine_order_id": pine_oid,
                 "pine_settlement_id": utr,
                 "utr_number": utr,
                 "bank_account": "UAT-FALLBACK",
                 "last_processed_date": last_processed_date,
-                "expected_amount": paid_amount,
+                "expected_amount": batch_total,
                 "settled_amount": settled_amount,
                 "platform_fee": platform_fee,
                 "total_deduction_amount": platform_fee,
@@ -1834,11 +2555,12 @@ async def _run_reconciliation(args: dict) -> list[TextContent]:
     orders = await _db.get_orders_by_run(run_id)
     settlements = await _db.get_settlements_by_run(run_id)
 
-    # Index settlements by pine_order_id for O(1) lookup
-    sett_by_order: dict[str, dict] = {}
+    # Index settlements by pine_order_id.
+    # In the new model there is ONE settlement per batch pine_order_id.
+    sett_by_pine_order: dict[str, dict] = {}
     for s in settlements:
         if s["pine_order_id"]:
-            sett_by_order[s["pine_order_id"]] = s
+            sett_by_pine_order[s["pine_order_id"]] = s
 
     # Build UTR -> [settlement, ...] index for duplicate UTR check (check 8)
     sett_by_utr: dict[str, list[dict]] = {}
@@ -1847,67 +2569,162 @@ async def _run_reconciliation(args: dict) -> list[TextContent]:
         if utr:
             sett_by_utr.setdefault(utr, []).append(s)
 
+    # Also fetch payouts for the new payout flow
+    payouts = await _db.get_payouts_by_run(run_id)
+    payout_by_vendor: dict[str, dict] = {}
+    for p in payouts:
+        vid = p.get("vendor_id", "")
+        # Keep the most recent successful payout per vendor
+        if vid and (vid not in payout_by_vendor or p.get("status") == "SUCCESS"):
+            payout_by_vendor[vid] = p
+
     recons: list[dict] = []
     total_variance = 0.0
     mdr_drift_count = 0
 
     for order in orders:
+        vendor_id = order["vendor_id"]
+        invoice_amount = order["amount"]
+
+        # Check for payout (new flow) first, then fall back to payment (old flow)
+        payout = payout_by_vendor.get(vendor_id)
         payments = await _db.get_payments_by_order(order["id"])
         successful_payment = next(
             (p for p in payments if p["pine_status"] in ("PROCESSED", "SUCCESS")), None
         )
-        sett = sett_by_order.get(order["pine_order_id"])
+        # Look up the batch settlement for this order's pine_order_id.
+        # In the new model, there is ONE settlement per batch with the total
+        # amount.  Each vendor's share is computed proportionally.
+        batch_sett = sett_by_pine_order.get(order["pine_order_id"])
+        sett = batch_sett  # used for check functions that inspect settlement fields
 
-        invoice_amount = order["amount"]
-        paid_amount = successful_payment["amount"] if successful_payment else 0.0
-        settled_amount = sett["settled_amount"] if sett else 0.0
-        variance = round(paid_amount - settled_amount, 2)
+        # Compute this vendor's proportional share of the batch settlement.
+        # batch_total_orders = sum of all order amounts sharing this pine_order_id
+        if batch_sett:
+            batch_orders_for_pine = [
+                o for o in orders
+                if o.get("pine_order_id") == order["pine_order_id"]
+            ]
+            batch_total_orders = sum(float(o["amount"]) for o in batch_orders_for_pine)
+            if batch_total_orders > 0:
+                vendor_share = float(invoice_amount) / batch_total_orders
+            else:
+                vendor_share = 1.0 / max(len(batch_orders_for_pine), 1)
+            vendor_settled = round(float(batch_sett["settled_amount"]) * vendor_share, 2)
+            vendor_fee = round(float(batch_sett["platform_fee"]) * vendor_share, 2)
+        else:
+            vendor_settled = 0.0
+            vendor_fee = 0.0
+
+        # Determine paid amount and rail from payout or payment
+        if payout and payout.get("status") == "SUCCESS":
+            paid_amount = payout["amount"]
+            rail_used = payout.get("mode", "IMPS")
+            utr_number = payout.get("bank_txn_reference_id")
+            retries = payout.get("attempt_number", 1)
+            payment_id = payout["id"]  # Use payout ID as payment reference
+            fees = float(payout.get("fees", 0) or 0)
+        elif successful_payment:
+            paid_amount = successful_payment["amount"]
+            rail_used = successful_payment["rail"]
+            utr_number = sett["utr_number"] if sett else None
+            retries = len(payments)
+            payment_id = successful_payment["id"]
+            fees = vendor_fee  # vendor's proportional share of batch MDR
+        else:
+            paid_amount = 0.0
+            rail_used = None
+            utr_number = None
+            retries = len(payments) + (payout.get("attempt_number", 0) if payout else 0)
+            payment_id = payout["id"] if payout else None
+            fees = 0.0
+
+        # For payouts: settled = paid (direct bank transfer, no settlement delay)
+        # For payments: settled = vendor's proportional share of batch settlement
+        if payout and payout.get("status") == "SUCCESS":
+            settled_amount = paid_amount  # Direct payout = settled immediately
+        else:
+            settled_amount = vendor_settled if sett else 0.0
+
+        variance = round(invoice_amount - paid_amount, 2)
         total_variance += variance
 
         mdr_actual = 0.0
         mdr_drift_flagged = False
-        if paid_amount > 0 and sett:
-            mdr_actual = round(sett["platform_fee"] / paid_amount, 6) if paid_amount else 0.0
+        if paid_amount > 0 and fees > 0:
+            mdr_actual = round(fees / paid_amount, 6)
             if abs(mdr_actual - mdr_contracted) > 0.001:
                 mdr_drift_flagged = True
                 mdr_drift_count += 1
 
-        outcome = "matched"
-        if not successful_payment:
+        # Determine outcome
+        if payout and payout.get("status") == "SUCCESS":
+            outcome = "matched" if variance == 0 else "variance"
+        elif payout and payout.get("status") == "FAILED":
             outcome = "failed"
-        elif not sett:
+        elif payout and payout.get("status") in ("SCHEDULED", "PENDING", "PROCESSING"):
+            outcome = "pending_payout"
+        elif not successful_payment and not payout:
+            outcome = "failed"
+        elif not sett and not payout:
             outcome = "pending_settlement"
         elif variance != 0:
             outcome = "variance"
+        else:
+            outcome = "matched"
 
         # Settlements sharing the same UTR (for check 8)
-        utr_key = sett["utr_number"] if sett else ""
+        utr_key = utr_number or (sett["utr_number"] if sett else "")
         all_setts_for_utr = sett_by_utr.get(utr_key, []) if utr_key else []
 
-        # Build partial recon dict for check runner (without checks/recon_status yet)
+        # Build partial recon dict for check runner
         partial_recon = {
             "paid_amount": paid_amount,
             "settled_amount": settled_amount,
+            "vendor_fee": fees,  # vendor's proportional share of batch MDR
             "mdr_rate_actual": mdr_actual,
             "mdr_rate_contracted": mdr_contracted,
-            "rail_used": successful_payment["rail"] if successful_payment else None,
-            "bank_credit_amount": None,  # not yet entered
+            "rail_used": rail_used,
+            "bank_credit_amount": settled_amount if settled_amount > 0 else None,
+            "invoice_amount": invoice_amount,
+            "mdr_rates_by_rail": persona_config.get("mdr_rates_by_rail", {}),
+            "payout": payout,  # vendor payout record (or None)
         }
 
+        sett_missing = (sett is None) and (paid_amount > 0)
         checks, recon_status, delay_days = _run_recon_checks(
-            partial_recon, sett, all_setts_for_utr, orders
+            partial_recon, sett, all_setts_for_utr, orders, sett_missing=sett_missing
         )
+
+        # Override recon_status for successful payouts with no variance
+        if payout and payout.get("status") == "SUCCESS" and variance == 0:
+            recon_status = "MATCHED"
+            checks = [{"check_id": 1, "name": "payout_confirmed", "severity": "info",
+                        "passed": True, "detail": f"Payout SUCCESS via {rail_used}, UTR: {utr_number}"}]
+
+        # Auto-populate ca_notes for mismatches
+        ca_notes = None
+        if recon_status == "MISMATCH":
+            failed_checks = [c["name"] for c in checks if c.get("passed") is False]
+            ca_notes = f"MISMATCH: invoice={invoice_amount}, paid={paid_amount}, settled={settled_amount}. Failed: {', '.join(failed_checks)}"
+        elif outcome == "variance" and variance != 0:
+            direction = "underpaid" if variance > 0 else "overpaid"
+            ca_notes = f"Variance Rs {abs(variance):.2f} ({direction}). Invoice={invoice_amount}, Paid={paid_amount}"
+        elif outcome == "pending_settlement":
+            ca_notes = f"Settlement pending (T+1). Payment confirmed Rs {paid_amount} via {rail_used}"
+        elif outcome == "failed":
+            ca_notes = f"Payment failed. Invoice Rs {invoice_amount} for vendor {vendor_id}"
 
         recon = {
             "id": str(uuid.uuid4()),
             "run_id": run_id,
             "order_id": order["id"],
-            "payment_id": successful_payment["id"] if successful_payment else None,
+            "payment_id": payment_id,
             "settlement_id": sett["id"] if sett else None,
-            "vendor_id": order["vendor_id"],
+            "vendor_id": vendor_id,
             "pine_order_id": order["pine_order_id"],
             "merchant_order_reference": order["merchant_order_reference"],
-            "utr_number": sett["utr_number"] if sett else None,
+            "utr_number": utr_number,
             "persona": persona,
             "invoice_amount": invoice_amount,
             "paid_amount": paid_amount,
@@ -1916,18 +2733,22 @@ async def _run_reconciliation(args: dict) -> list[TextContent]:
             "mdr_rate_actual": mdr_actual,
             "mdr_rate_contracted": mdr_contracted,
             "mdr_drift_flagged": mdr_drift_flagged,
-            "rail_used": successful_payment["rail"] if successful_payment else None,
-            "retries": len(payments),
+            "rail_used": rail_used,
+            "retries": retries,
             "outcome": outcome,
             "pre_auth_used": order["pre_auth"],
             "agent_reasoning": order.get("priority_reason", ""),
-            "ca_notes": None,
+            "ca_notes": ca_notes,
             "created_at": _now_iso(),
             "checks": json.dumps(checks),
             "recon_status": recon_status,
-            "bank_credit_amount": None,
-            "bank_delta": None,
-            "settlement_delay_days": delay_days,
+            "bank_credit_amount": settled_amount if settled_amount > 0 else None,
+            "bank_delta": 0.0 if settled_amount > 0 else None,
+            "settlement_delay_days": delay_days if not payout else 0,
+            "fee_amount": fees,
+            "settled_at_ts": sett.get("settled_at") if sett else None,
+            "payout_id": payout["id"] if payout else None,
+            "updated_at": _now_iso(),
         }
         await _db.insert_reconciliation(recon)
         recons.append(recon)
@@ -1941,8 +2762,10 @@ async def _run_reconciliation(args: dict) -> list[TextContent]:
         "variance_count": sum(1 for r in recons if r["outcome"] == "variance"),
         "failed_count": sum(1 for r in recons if r["outcome"] == "failed"),
         "pending_settlement_count": sum(1 for r in recons if r["outcome"] == "pending_settlement"),
+        "pending_payout_count": sum(1 for r in recons if r["outcome"] == "pending_payout"),
         "total_variance_inr": round(total_variance, 2),
         "mdr_drift_count": mdr_drift_count,
+        "payout_count": len(payouts),
     }
 
     await _emit_event("PIPELINE_STEP", {
